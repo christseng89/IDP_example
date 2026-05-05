@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: svc-beta
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: file:///idp-local/charts/svc-beta
+    targetRevision: HEAD
+    path: .
+    helm:
+      releaseName: svc-beta
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: svc-beta
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

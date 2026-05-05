@@ -1,0 +1,43 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: idp-demo
+  title: IDP Demo System
+  description: Local IDP demonstration system — full five-layer CNCF stack on Docker Desktop
+spec:
+  owner: platform-team
+---
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: platform-team
+  title: Platform Team
+spec:
+  type: team
+  children: []
+---
+# Pull in the two service catalog entries from their source directories
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: svc-alpha
+spec:
+  type: file
+  target: /backstage/catalog/svc-alpha-catalog.yaml
+---
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: svc-beta
+spec:
+  type: file
+  target: /backstage/catalog/svc-beta-catalog.yaml
+---
+# Scaffolder template location
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: scaffolder-templates
+spec:
+  type: file
+  target: /backstage/scaffolder-templates/new-service/template.yaml

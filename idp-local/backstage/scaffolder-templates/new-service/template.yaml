@@ -1,0 +1,85 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: new-idp-service
+  title: New IDP Service
+  description: >
+    Creates a new Node.js (Express) service following the IDP golden path:
+    v1/v2 API versioning, Prometheus metrics, Argo Rollouts canary strategy,
+    Backstage catalog entry, OpenAPI spec, and TechDocs.
+  tags:
+    - nodejs
+    - rest-api
+    - canary
+    - golden-path
+spec:
+  owner: platform-team
+  type: service
+
+  parameters:
+    - title: Service details
+      required:
+        - serviceName
+        - owner
+        - description
+      properties:
+        serviceName:
+          title: Service Name
+          type: string
+          description: Lowercase, kebab-case (e.g. svc-gamma)
+          pattern: "^[a-z][a-z0-9-]+$"
+        owner:
+          title: Owner Team
+          type: string
+          default: platform-team
+        description:
+          title: Description
+          type: string
+
+    - title: Infrastructure
+      properties:
+        replicaCount:
+          title: Initial replica count
+          type: integer
+          default: 2
+        cpuRequest:
+          title: CPU request (millicores)
+          type: string
+          default: "50m"
+        memoryRequest:
+          title: Memory request
+          type: string
+          default: "64Mi"
+
+  steps:
+    - id: fetch-template
+      name: Fetch base template
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          serviceName: ${{ parameters.serviceName }}
+          owner: ${{ parameters.owner }}
+          description: ${{ parameters.description }}
+          replicaCount: ${{ parameters.replicaCount }}
+          cpuRequest: ${{ parameters.cpuRequest }}
+          memoryRequest: ${{ parameters.memoryRequest }}
+
+    - id: publish
+      name: Publish to local filesystem
+      action: publish:file
+      input:
+        path: ./services/${{ parameters.serviceName }}
+
+    - id: register
+      name: Register in Backstage catalog
+      action: catalog:register
+      input:
+        catalogInfoPath: ./catalog-info.yaml
+
+  output:
+    links:
+      - title: Service in Catalog
+        entityRef: component:default/${{ parameters.serviceName }}
+      - title: Argo CD Application
+        url: http://localhost/argocd/applications/${{ parameters.serviceName }}

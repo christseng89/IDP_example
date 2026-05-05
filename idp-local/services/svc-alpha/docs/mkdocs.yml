@@ -1,0 +1,5 @@
+site_name: Service Alpha
+site_description: IDP demo primary service — canary rollout and API versioning
+docs_dir: .
+nav:
+  - Home: index.md

@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log
+.npmrc
+.env
+.env.*
+*.test.js
+*.spec.js
+coverage/
+.nyc_output/
+.git
+.gitignore
+eslint.config.js
+.eslintrc*
+docs/
+catalog-info.yaml
+openapi.yaml

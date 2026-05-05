@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ .Release.Name }}-success-rate
+  namespace: {{ .Release.Namespace }}
+spec:
+  metrics:
+    - name: success-rate
+      interval: 30s
+      count: 3
+      successCondition: result[0] >= 0.95
+      failureCondition: result[0] < 0.90
+      provider:
+        prometheus:
+          address: {{ .Values.prometheus.address }}
+          query: |
+            (
+              sum(rate(http_requests_total{service="{{ .Release.Name }}",status!~"5.."}[2m])) or vector(0)
+            )
+            /
+            clamp_min(sum(rate(http_requests_total{service="{{ .Release.Name }}"}[2m])), 0.001)

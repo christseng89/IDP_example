@@ -1,0 +1,5 @@
+site_name: Service Beta
+site_description: IDP demo downstream service
+docs_dir: .
+nav:
+  - Home: index.md

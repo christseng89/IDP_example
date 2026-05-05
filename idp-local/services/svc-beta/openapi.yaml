@@ -1,0 +1,88 @@
+openapi: "3.0.3"
+info:
+  title: Service Beta API
+  version: "2.0.0"
+  description: |
+    IDP demo downstream service — consumed by svc-alpha.
+    Demonstrates API versioning lifecycle (v1 → v2).
+
+servers:
+  - url: http://localhost/svc-beta
+    description: Local Docker Desktop
+
+paths:
+  /v1/hello:
+    get:
+      summary: Hello (v1)
+      operationId: helloV1
+      deprecated: true
+      description: Basic hello. **Deprecated** — migrate to v2.
+      parameters:
+        - name: fail
+          in: query
+          schema:
+            type: string
+            enum: [true]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HelloV1Response"
+
+  /v2/hello:
+    get:
+      summary: Hello (v2)
+      operationId: helloV2
+      description: Enriched hello response with timestamp, requestId and capabilities list.
+      parameters:
+        - name: fail
+          in: query
+          schema:
+            type: string
+            enum: [true]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HelloV2Response"
+
+components:
+  schemas:
+    HelloV1Response:
+      type: object
+      properties:
+        version:
+          type: string
+          example: v1
+        service:
+          type: string
+          example: svc-beta
+        message:
+          type: string
+          example: Hello from v1
+
+    HelloV2Response:
+      type: object
+      properties:
+        version:
+          type: string
+          example: v2
+        service:
+          type: string
+          example: svc-beta
+        message:
+          type: string
+          example: Hello from v2
+        timestamp:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+          format: uuid
+        capabilities:
+          type: array
+          items:
+            type: string
+          example: ["metrics", "health", "versioning"]

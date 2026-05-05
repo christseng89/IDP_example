@@ -1,0 +1,1 @@
+{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"backstage","Source":"./modules/backstage","Dir":"modules/backstage"},{"Key":"gitops","Source":"./modules/gitops","Dir":"modules/gitops"},{"Key":"observability","Source":"./modules/observability","Dir":"modules/observability"},{"Key":"platform","Source":"./modules/platform","Dir":"modules/platform"}]}

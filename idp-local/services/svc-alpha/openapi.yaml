@@ -1,0 +1,102 @@
+openapi: "3.0.3"
+info:
+  title: Service Alpha API
+  version: "2.0.0"
+  description: |
+    IDP demo service — demonstrates API versioning lifecycle (v1 → v2).
+
+    **v1**: Basic hello response.
+    **v2**: Enriched response with timestamp and requestId. v1 is deprecated but still active.
+  contact:
+    name: Platform Team
+
+servers:
+  - url: http://localhost/svc-alpha
+    description: Local Docker Desktop
+
+paths:
+  /v1/hello:
+    get:
+      summary: Hello (v1)
+      operationId: helloV1
+      deprecated: true
+      description: |
+        Basic hello response. **Deprecated** — migrate to v2.
+        Sunset date: see Sunset response header (RFC 8594).
+      parameters:
+        - name: fail
+          in: query
+          description: Set to "true" to trigger a simulated 500 (demo rollback)
+          schema:
+            type: string
+            enum: [true]
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HelloV1Response"
+        "500":
+          description: Simulated failure (demo only)
+
+  /v2/hello:
+    get:
+      summary: Hello (v2)
+      operationId: helloV2
+      description: Enriched hello response with timestamp and requestId.
+      parameters:
+        - name: fail
+          in: query
+          description: Set to "true" to trigger a simulated 500 (demo rollback)
+          schema:
+            type: string
+            enum: [true]
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HelloV2Response"
+        "500":
+          description: Simulated failure (demo only)
+
+components:
+  schemas:
+    HelloV1Response:
+      type: object
+      properties:
+        version:
+          type: string
+          example: v1
+        service:
+          type: string
+          example: svc-alpha
+        message:
+          type: string
+          example: Hello from v1
+
+    HelloV2Response:
+      type: object
+      properties:
+        version:
+          type: string
+          example: v2
+        service:
+          type: string
+          example: svc-alpha
+        message:
+          type: string
+          example: Hello from v2
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-05-05T12:00:00.000Z"
+        requestId:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        downstream:
+          type: string
+          example: "http://svc-beta.svc-beta.svc.cluster.local:3000"

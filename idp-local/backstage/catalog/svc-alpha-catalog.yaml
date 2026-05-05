@@ -1,0 +1,89 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: svc-alpha
+  title: Service Alpha
+  description: Primary IDP demo service. Calls svc-beta. Demonstrates canary rollout from v1 to v2.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    argocd/app-name: svc-alpha
+    backstage.io/kubernetes-id: svc-alpha
+    prometheus.io/scrape: "true"
+  tags:
+    - nodejs
+    - rest-api
+    - canary
+  links:
+    - url: http://localhost/svc-alpha/v1/hello
+      title: v1 Endpoint
+      icon: api
+    - url: http://localhost/svc-alpha/v2/hello
+      title: v2 Endpoint
+      icon: api
+    - url: http://localhost/rollouts
+      title: Argo Rollouts Dashboard
+      icon: dashboard
+spec:
+  type: service
+  lifecycle: production
+  owner: platform-team
+  system: idp-demo
+  dependsOn:
+    - component:svc-beta
+  providesApis:
+    - svc-alpha-api
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: svc-alpha-api
+  title: Service Alpha API
+  description: REST API with v1 and v2 endpoints demonstrating API versioning lifecycle (v1 deprecated, v2 production)
+spec:
+  type: openapi
+  lifecycle: production
+  owner: platform-team
+  system: idp-demo
+  definition: |
+    openapi: "3.0.3"
+    info:
+      title: Service Alpha API
+      version: "2.0.0"
+      description: "IDP demo service — v1 (deprecated) and v2 (production) endpoints."
+    servers:
+      - url: http://localhost/svc-alpha
+    paths:
+      /v1/hello:
+        get:
+          summary: Hello (v1)
+          operationId: helloV1
+          deprecated: true
+          responses:
+            "200":
+              description: Basic hello response
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      version: { type: string, example: v1 }
+                      service: { type: string, example: svc-alpha }
+                      message: { type: string, example: "Hello from v1" }
+      /v2/hello:
+        get:
+          summary: Hello (v2)
+          operationId: helloV2
+          responses:
+            "200":
+              description: Enriched hello response
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      version: { type: string, example: v2 }
+                      service: { type: string, example: svc-alpha }
+                      message: { type: string, example: "Hello from v2" }
+                      timestamp: { type: string, format: date-time }
+                      requestId: { type: string, format: uuid }
+                      downstream: { type: string }

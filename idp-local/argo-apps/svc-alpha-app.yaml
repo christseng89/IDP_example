@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: svc-alpha
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    # Uses local file path — no external Git required for Docker Desktop demo
+    repoURL: file:///idp-local/charts/svc-alpha
+    targetRevision: HEAD
+    path: .
+    helm:
+      releaseName: svc-alpha
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: svc-alpha
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

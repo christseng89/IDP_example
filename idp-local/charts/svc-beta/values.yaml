@@ -1,0 +1,21 @@
+image:
+  repository: svc-beta
+  tag: v1
+  pullPolicy: Never
+
+replicaCount: 2
+
+service:
+  port: 3000
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 128Mi
+
+prometheus:
+  namespace: monitoring
+  address: http://prometheus-stack-kube-prom-prometheus.monitoring:9090

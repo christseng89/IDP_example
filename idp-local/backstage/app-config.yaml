@@ -1,0 +1,66 @@
+app:
+  title: IDP Demo Portal
+  baseUrl: http://localhost/backstage
+
+organization:
+  name: Platform Engineering
+
+backend:
+  baseUrl: http://localhost/backstage
+  listen:
+    port: 7007
+  database:
+    client: better-sqlite3
+    connection: ':memory:'
+  cors:
+    origin: http://localhost/backstage
+    methods: [GET, HEAD, PATCH, POST, PUT, DELETE]
+
+integrations: {}
+
+techdocs:
+  builder: local
+  generator:
+    runIn: local
+  publisher:
+    type: local
+
+auth:
+  providers: {}
+
+catalog:
+  import:
+    entityFilename: catalog-info.yaml
+    pullRequestBranchName: backstage-integration
+  rules:
+    - allow: [Component, System, API, Group, User, Resource, Location, Template]
+  locations:
+    - type: file
+      target: /backstage/catalog/all.yaml
+      rules:
+        - allow: [System, Group, Location]
+
+argocd:
+  username: admin
+  password: ${ARGOCD_ADMIN_PASSWORD}
+  waitCycles: 25
+  appLocatorMethods:
+    - type: config
+      instances:
+        - name: local
+          url: http://argocd-server.argocd.svc.cluster.local
+
+kubernetes:
+  serviceLocatorMethod:
+    type: multiTenant
+  clusterLocatorMethods:
+    - type: config
+      clusters:
+        - name: docker-desktop
+          url: https://kubernetes.default.svc
+          authProvider: serviceAccount
+          skipTLSVerify: true # demo-only: Docker Desktop uses a self-signed cert
+          serviceAccountToken:
+            $secret:
+              name: backstage-k8s-token
+              key: token

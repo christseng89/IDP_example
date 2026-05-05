@@ -1,0 +1,28 @@
+image:
+  repository: svc-alpha
+  tag: v1
+  pullPolicy: Never   # local Docker Desktop image store
+
+replicaCount: 2
+
+service:
+  port: 3000
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 128Mi
+
+canary:
+  # Weight steps for the canary rollout (percentage to canary)
+  steps:
+    - weight: 20
+    - weight: 50
+    - weight: 100
+
+prometheus:
+  namespace: monitoring
+  address: http://prometheus-stack-kube-prom-prometheus.monitoring:9090
