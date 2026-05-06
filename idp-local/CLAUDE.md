@@ -145,5 +145,12 @@ Four pre-generated Word documents live in the project root:
 - Backstage ClusterRole: read-only, no `configmaps` (prevents secret exposure via ConfigMaps)
 - Argo CD RBAC: `policy.default: role:readonly` (unauthenticated callers are read-only)
 - NetworkPolicies: deny-all default + selective allow per namespace
-- Kyverno: two `Audit` policies (require version label, require securityContext)
+- Kyverno: two `Enforce` policies (require version label, require securityContext) — controlled by `var.kyverno_enforcement_mode` (default: `Enforce`; set to `Audit` for development)
 - Dependency versions pinned (no `^` caret in package.json)
+- CI: `npm audit --audit-level=high` blocks on HIGH/CRITICAL dependency vulnerabilities (SOC2 CC8.3)
+- CI: Trivy container scan on all four images blocks on fixable HIGH/CRITICAL CVEs (SOC2 CC8.3)
+- CI: `deploy-gate` job requires manual reviewer approval via GitHub Environment `production` before any push to main is considered deployment-ready (SOC2 CC8.2)
+
+### GitHub Environment setup (one-time)
+
+Create the `production` environment in **Settings → Environments → New environment** and add at least one required reviewer. The `deploy-gate` CI job will pause until a reviewer approves, providing the human approval evidence SOC2 CC8.2 requires.

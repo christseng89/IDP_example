@@ -1,5 +1,7 @@
 module "platform" {
   source = "./modules/platform"
+
+  kyverno_enforcement_mode = var.kyverno_enforcement_mode
 }
 
 module "observability" {

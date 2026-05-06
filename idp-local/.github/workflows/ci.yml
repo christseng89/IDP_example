@@ -9,7 +9,7 @@ on:
 jobs:
   # ── Node.js services ─────────────────────────────────────────────────────────
   svc-alpha:
-    name: svc-alpha lint + test
+    name: svc-alpha lint + test + audit
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -22,9 +22,11 @@ jobs:
       - run: npm install
       - run: npm run lint
       - run: npm test
+      - name: Dependency vulnerability audit
+        run: npm audit --audit-level=high
 
   svc-beta:
-    name: svc-beta lint + test
+    name: svc-beta lint + test + audit
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -37,22 +39,60 @@ jobs:
       - run: npm install
       - run: npm run lint
       - run: npm test
+      - name: Dependency vulnerability audit
+        run: npm audit --audit-level=high
 
-  # ── Docker image builds ───────────────────────────────────────────────────────
-  docker-build:
-    name: Docker build (smoke test)
+  # ── Docker image builds + Trivy container scanning ───────────────────────────
+  build-and-scan:
+    name: Docker build + Trivy scan
     runs-on: ubuntu-latest
     needs: [svc-alpha, svc-beta]
     steps:
       - uses: actions/checkout@v4
+
       - name: Build svc-alpha:v1
         run: docker build --build-arg VERSION=v1 -t svc-alpha:v1 services/svc-alpha
+      - name: Scan svc-alpha:v1
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: svc-alpha:v1
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
       - name: Build svc-alpha:v2
         run: docker build --build-arg VERSION=v2 -t svc-alpha:v2 services/svc-alpha
+      - name: Scan svc-alpha:v2
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: svc-alpha:v2
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
       - name: Build svc-beta:v1
         run: docker build --build-arg VERSION=v1 -t svc-beta:v1 services/svc-beta
+      - name: Scan svc-beta:v1
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: svc-beta:v1
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
       - name: Build svc-beta:v2
         run: docker build --build-arg VERSION=v2 -t svc-beta:v2 services/svc-beta
+      - name: Scan svc-beta:v2
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: svc-beta:v2
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
 
   # ── Helm charts ───────────────────────────────────────────────────────────────
   helm-lint:
@@ -103,3 +143,28 @@ jobs:
                 level: warning
               truthy:
                 allowed-values: ['true', 'false', 'yes', 'no']
+
+  # ── Production deployment gate (SOC2 CC8.2) ──────────────────────────────────
+  # Runs only on push to main. Requires manual approval from a designated
+  # reviewer configured in the "production" GitHub Environment. All quality
+  # checks above must pass before the approval request is raised.
+  deploy-gate:
+    name: Production deployment gate
+    runs-on: ubuntu-latest
+    needs:
+      - svc-alpha
+      - svc-beta
+      - build-and-scan
+      - helm-lint
+      - terraform-validate
+      - yaml-lint
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - name: All gates passed
+        run: |
+          echo "Reviewer approved production deployment."
+          echo "Commit: ${{ github.sha }}"
+          echo "Actor:  ${{ github.actor }}"
+          echo "Ref:    ${{ github.ref }}"

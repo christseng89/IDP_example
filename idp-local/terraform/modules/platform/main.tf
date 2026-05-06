@@ -15,6 +15,20 @@ terraform {
   }
 }
 
+# SOC2 CC7.1 — policy enforcement mode.
+# Default is Enforce (blocks non-compliant resources).
+# Set to Audit in development environments to log-only.
+variable "kyverno_enforcement_mode" {
+  description = "Kyverno validationFailureAction: Enforce blocks non-compliant resources; Audit only logs violations."
+  type        = string
+  default     = "Enforce"
+
+  validation {
+    condition     = contains(["Audit", "Enforce"], var.kyverno_enforcement_mode)
+    error_message = "kyverno_enforcement_mode must be Audit or Enforce."
+  }
+}
+
 resource "kubernetes_namespace" "ingress_nginx" {
   metadata { name = "ingress-nginx" }
 }
@@ -124,7 +138,7 @@ resource "kubectl_manifest" "kyverno_require_version_label" {
           All Argo Rollout resources must carry the app.kubernetes.io/version
           label so platform tooling can track which version is running.
     spec:
-      validationFailureAction: Audit
+      validationFailureAction: ${var.kyverno_enforcement_mode}
       rules:
         - name: check-version-label
           match:
@@ -156,7 +170,7 @@ resource "kubectl_manifest" "kyverno_require_security_context" {
           All Argo Rollout pod templates must set runAsNonRoot: true and
           allowPrivilegeEscalation: false to prevent privilege escalation attacks.
     spec:
-      validationFailureAction: Audit
+      validationFailureAction: ${var.kyverno_enforcement_mode}
       rules:
         - name: check-pod-security-context
           match:
