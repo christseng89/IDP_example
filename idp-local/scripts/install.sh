@@ -1,457 +1,241 @@
 #!/usr/bin/env bash
-# install.sh — Full non-interactive installation of the idp-local IDP platform.
-# Run from any directory; the script locates the repository root automatically.
+# install.sh — Simple, predictable installation of the idp-local IDP platform.
+#
+# Strategy: pre-pull every Docker Hub image kubelet will need via a working
+# mirror, retag to the original references, then run terraform. Kubelet finds
+# the images locally and never tries to reach Docker Hub itself, so installs
+# work even when registry-1.docker.io is blocked / DNS-hijacked.
 #
 # Usage:
-#   bash scripts/install.sh [--dry-run] [--skip-images] [--enforce-mode Audit|Enforce]
+#   bash scripts/install.sh
 #
-# Flags:
-#   --dry-run         Print what would be done; do not execute destructive commands.
-#   --skip-images     Skip Docker image builds (use if images are already present).
-#   --enforce-mode    Kyverno validationFailureAction (default: Enforce).
+# Optional env vars:
+#   DOCKER_MIRROR   docker.io mirror (default: docker.m.daocloud.io)
+#   K8S_MIRROR      registry.k8s.io mirror (default: k8s.m.daocloud.io)
+#   KYVERNO_MODE    Audit | Enforce  (default: Enforce)
+#   SKIP_BUILD      true to skip building svc-alpha/svc-beta images
 
 set -euo pipefail
 
-# ── Colour helpers ────────────────────────────────────────────────────────────
-BOLD='\033[1m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DOCKER_MIRROR="${DOCKER_MIRROR:-docker.m.daocloud.io}"
+K8S_MIRROR="${K8S_MIRROR:-k8s.m.daocloud.io}"
+KYVERNO_MODE="${KYVERNO_MODE:-Enforce}"
+SKIP_BUILD="${SKIP_BUILD:-false}"
 
-log()     { echo -e "${CYAN}${BOLD}[IDP]${NC} $*"; }
-ok()      { echo -e "  ${GREEN}✔${NC} $*"; }
-warn()    { echo -e "  ${YELLOW}⚠${NC}  $*"; }
-fail()    { echo -e "  ${RED}✘${NC}  $*" >&2; }
-section() { echo -e "\n${BOLD}━━━  $* ━━━${NC}"; }
-hr()      { echo -e "${CYAN}────────────────────────────────────────────────────${NC}"; }
+# ── Logging helpers ──────────────────────────────────────────────────────────
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+log()  { echo -e "${CYAN}${BOLD}[IDP]${NC} $*"; }
+ok()   { echo -e "  ${GREEN}✔${NC} $*"; }
+warn() { echo -e "  ${YELLOW}⚠${NC}  $*"; }
+fail() { echo -e "  ${RED}✘${NC}  $*" >&2; }
+step() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
-DRY_RUN=false
-SKIP_IMAGES=false
-KYVERNO_MODE="Enforce"
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 1 — Prerequisites"
+# ────────────────────────────────────────────────────────────────────────────
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dry-run)       DRY_RUN=true ;;
-    --skip-images)   SKIP_IMAGES=true ;;
-    --enforce-mode)  KYVERNO_MODE="${2:?--enforce-mode requires Audit or Enforce}"; shift ;;
-    *) fail "Unknown flag: $1"; exit 1 ;;
-  esac
-  shift
+for tool in docker kubectl helm terraform; do
+  if command -v "$tool" >/dev/null; then
+    ok "$tool found"
+  else
+    fail "$tool not found in PATH"
+    exit 1
+  fi
 done
 
-if [[ "$DRY_RUN" == "true" ]]; then
-  warn "DRY-RUN mode — no state will be changed."
+if ! docker info >/dev/null 2>&1; then
+  fail "Docker daemon not running. Start Docker Desktop and re-run."
+  exit 1
 fi
+ok "Docker daemon reachable"
 
-# ── Resolve repository root ───────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if ! kubectl cluster-info --context docker-desktop >/dev/null 2>&1; then
+  fail "Docker Desktop Kubernetes not running. Enable in Settings → Kubernetes → Enable Kubernetes."
+  exit 1
+fi
+ok "Docker Desktop Kubernetes reachable"
 
-log "Repository root : $REPO_ROOT"
-log "Kyverno mode    : $KYVERNO_MODE"
-echo ""
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 2 — Pre-pull images via mirrors"
+# ────────────────────────────────────────────────────────────────────────────
+# registry.k8s.io images — pulled via K8S_MIRROR (default: k8s.m.daocloud.io).
+# The nginx-ingress controller image is the #1 cause of "context deadline exceeded"
+# on Docker Desktop when registry.k8s.io is slow or blocked.
 
-# ── Helper: run or print ──────────────────────────────────────────────────────
-run() {
-  if [[ "$DRY_RUN" == "true" ]]; then
-    echo -e "  ${YELLOW}[dry-run]${NC} $*"
-  else
-    "$@"
-  fi
-}
-
-# ── Helper: require a command ─────────────────────────────────────────────────
-require() {
-  local cmd="$1" hint="${2:-}"
-  if command -v "$cmd" &>/dev/null; then
-    ok "$cmd $(${cmd} --version 2>&1 | head -1)"
-  else
-    fail "$cmd not found.${hint:+ Install from: $hint}"
-    PREREQ_FAIL=true
-  fi
-}
-
-# ── Helper: wait for all Deployments in a namespace ──────────────────────────
-wait_namespace() {
-  local ns="$1" timeout="${2:-300}"
-  log "Waiting for deployments in namespace/$ns (timeout ${timeout}s)…"
-  if ! kubectl wait --for=condition=available deployment --all -n "$ns" \
-       --timeout="${timeout}s" 2>/dev/null; then
-    warn "Some pods in $ns are still starting. Check with:"
-    warn "  kubectl get pods -n $ns"
-  else
-    ok "namespace/$ns ready"
-  fi
-}
-
-# ── Helper: wait for an Argo Rollout ─────────────────────────────────────────
-# Uses plain kubectl so the kubectl-argo-rollouts plugin is not required.
-wait_rollout() {
-  local ns="$1" timeout="${2:-180}"
-  local name
-  name="$(kubectl get rollout -n "$ns" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  if [[ -z "$name" ]]; then
-    warn "No rollout found in $ns — skipping."
-    return
-  fi
-  log "Waiting for rollout/$name in $ns (timeout ${timeout}s)…"
-  local deadline=$(( SECONDS + timeout ))
-  while [[ $SECONDS -lt $deadline ]]; do
-    local phase
-    phase="$(kubectl get rollout "$name" -n "$ns" \
-              -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    if [[ "$phase" == "Healthy" || "$phase" == "Paused" ]]; then
-      ok "rollout/$name $phase"
-      return
-    fi
-    sleep 5
-  done
-  warn "rollout/$name not yet Healthy after ${timeout}s. Check with:"
-  warn "  kubectl get rollout $name -n $ns -o yaml"
-}
-
-# ── Helper: HTTP smoke test ───────────────────────────────────────────────────
-smoke_test() {
-  local label="$1" url="$2" expected_status="${3:-200}"
-  local status
-  status="$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000")"
-  if [[ "$status" == "$expected_status" ]]; then
-    ok "HTTP $status  $label  ($url)"
-  else
-    warn "HTTP $status  $label  ($url)  — expected $expected_status"
-  fi
-}
-
-# ── Helper: auto-configure Docker registry mirrors ────────────────────────────
-# Two-pronged fix:
-#   A) Patches daemon.json → benefits Kubernetes pod image pulls (persistent).
-#   B) Exports DOCKER_MIRROR → build-images.sh uses it immediately without
-#      waiting for a Docker Desktop restart.
-# Docker Desktop is restarted so daemon.json takes effect for K8s; if the
-# restart fails for any reason, DOCKER_MIRROR still covers the build phase.
-configure_registry_mirrors() {
-  # Always export DOCKER_MIRROR first so build-images.sh can proceed even if
-  # daemon.json patching or Docker Desktop restart fails or is slow.
-  export DOCKER_MIRROR="${DOCKER_MIRROR:-docker.m.daocloud.io}"
-
-  log "Auto-configuring Docker registry mirrors in daemon.json…"
-
-  # ── Step A: patch daemon.json ─────────────────────────────────────────────
-  local ps_patch
-  ps_patch="$(mktemp).ps1"
-
-  cat > "$ps_patch" <<'POWERSHELL'
-$daemonJson = "$env:APPDATA\Docker\daemon.json"
-$mirrors = @(
-  "https://docker.m.daocloud.io",
-  "https://dockerhub.azk8s.cn"
+K8S_IMAGES=(
+  # ingress-nginx chart 4.9.1 → controller v1.9.6
+  "ingress-nginx/controller:v1.9.6"
 )
 
-if (Test-Path $daemonJson) {
-  try   { $cfg = Get-Content $daemonJson -Raw | ConvertFrom-Json }
-  catch { $cfg = [PSCustomObject]@{} }
-} else {
-  $null = New-Item -ItemType Directory -Force -Path (Split-Path $daemonJson)
-  $cfg = [PSCustomObject]@{}
-}
-
-$existing = if ($cfg.PSObject.Properties['registry-mirrors']) {
-              [string[]]$cfg.'registry-mirrors'
-            } else { @() }
-
-$merged = @($mirrors + $existing | Select-Object -Unique)
-
-if ($cfg.PSObject.Properties['registry-mirrors']) {
-  $cfg.'registry-mirrors' = $merged
-} else {
-  $cfg | Add-Member -MemberType NoteProperty -Name 'registry-mirrors' -Value $merged
-}
-
-$cfg | ConvertTo-Json -Depth 10 | Set-Content $daemonJson -Encoding UTF8
-Write-Host "  Written  : $daemonJson"
-Write-Host "  Mirrors  : $($merged -join ', ')"
-POWERSHELL
-
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-       -File "$(cygpath -w "$ps_patch")" 2>&1; then
-    ok "daemon.json updated"
+for img in "${K8S_IMAGES[@]}"; do
+  mirrored="${K8S_MIRROR}/${img}"
+  canonical="registry.k8s.io/${img}"
+  echo "  ⇣ ${mirrored}"
+  if docker pull --quiet "$mirrored" >/dev/null 2>&1; then
+    docker tag "$mirrored" "$canonical" >/dev/null 2>&1 || true
+    ok "${canonical} cached locally"
   else
-    warn "daemon.json patch failed — DOCKER_MIRROR env var will cover the build phase."
+    warn "Could not pull ${mirrored} — kubelet will try registry.k8s.io directly."
+    warn "  Override mirror: export K8S_MIRROR=<host> and re-run."
   fi
-  rm -f "$ps_patch"
+done
 
-  # ── Step B: restart Docker Desktop so daemon.json takes effect for K8s ───
-  # Docker Desktop 4.x runs dockerd inside WSL2; com.docker.service is not the
-  # live daemon.  We must kill the full process tree and relaunch.
-  log "Restarting Docker Desktop to apply mirror settings (~45 s)…"
+# Docker Hub images — pulled via DOCKER_MIRROR and retagged to docker.io.
+HUB_IMAGES=(
+  # kube-prometheus-stack (Grafana subchart — already overridden in values too,
+  # but pre-pulling makes the install robust if the override fails).
+  "grafana/grafana:10.4.0"
 
-  local ps_restart
-  ps_restart="$(mktemp).ps1"
+  # ArgoCD — Redis subchart from Bitnami / docker.io
+  "redis:7.2.4-alpine"
 
-  cat > "$ps_restart" <<'POWERSHELL'
-# Kill every Docker Desktop-related process, then relaunch
-$names = @("Docker Desktop", "com.docker.backend", "com.docker.dev-envs")
-foreach ($n in $names) {
-  Get-Process $n -ErrorAction SilentlyContinue |
-    ForEach-Object {
-      $_.CloseMainWindow() | Out-Null
-      $_ | Wait-Process -Timeout 8 -ErrorAction SilentlyContinue
-      if (-not $_.HasExited) { $_ | Stop-Process -Force -ErrorAction SilentlyContinue }
-    }
-}
-Start-Sleep -Seconds 8   # let WSL2 backend fully shut down
+  # Backstage — community image used by the chart
+  "backstage/backstage:latest"
 
-$exe = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
-if (-not (Test-Path $exe)) {
-  $exe = Join-Path $env:LOCALAPPDATA "Programs\Docker\Docker\Docker Desktop.exe"
-}
-if (-not (Test-Path $exe)) {
-  Write-Error "Docker Desktop executable not found — restart it manually."
-  exit 1
-}
-Start-Process $exe -WindowStyle Hidden
-Write-Host "  Launched : $exe"
-POWERSHELL
+  # Kyverno cleanup controller image (failing as of last run)
+  "ghcr.io/kyverno/cleanup-controller:v1.11.4"
+)
 
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-       -File "$(cygpath -w "$ps_restart")" 2>&1; then
-    # ── Step C: wait for daemon to respond (up to 90 s) ──────────────────
-    log "Waiting for Docker daemon to become ready…"
-    local i=0
-    while ! docker info &>/dev/null 2>&1; do
-      sleep 3; i=$(( i + 1 ))
-      if [[ $i -ge 30 ]]; then
-        warn "Docker daemon did not respond within 90 s — continuing anyway."
-        break
-      fi
-    done
-    if docker info &>/dev/null 2>&1; then
-      ok "Docker Desktop restarted; registry mirrors active for K8s pulls"
-      DOCKER_RESTARTED=true
-    fi
+prepull() {
+  local img="$1"
+  local mirrored="${DOCKER_MIRROR}/${img}"
+
+  echo "  ⇣ ${mirrored}"
+  if docker pull --quiet "$mirrored" >/dev/null 2>&1; then
+    docker tag "$mirrored" "docker.io/${img}" >/dev/null 2>&1 || true
+    docker tag "$mirrored" "${img}"           >/dev/null 2>&1 || true
+    ok "${img} cached locally"
   else
-    warn "Docker Desktop restart failed. daemon.json is updated for the next startup."
-    warn "For K8s pod pulls to use mirrors now: right-click Docker tray → Restart."
+    warn "Could not pull ${mirrored} — kubelet may fail this image."
+    warn "  Try a different mirror: export DOCKER_MIRROR=<host> and re-run."
   fi
-  rm -f "$ps_restart"
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-section "STEP 1 — Prerequisites"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+for img in "${HUB_IMAGES[@]}"; do
+  prepull "$img"
+done
 
-PREREQ_FAIL=false
-DOCKER_RESTARTED=false
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 3 — Build service images (svc-alpha, svc-beta)"
+# ────────────────────────────────────────────────────────────────────────────
 
-# docker, terraform support --version; kubectl and helm need their own flags
-require docker    "https://docs.docker.com/desktop/"
-require terraform "https://developer.hashicorp.com/terraform/install"
-
-if command -v kubectl &>/dev/null; then
-  ok "kubectl $(kubectl version --client --output=yaml 2>/dev/null | grep gitVersion | head -1 | awk '{print $2}')"
-else
-  fail "kubectl not found. Install from: https://kubernetes.io/docs/tasks/tools/"
-  PREREQ_FAIL=true
-fi
-
-if command -v helm &>/dev/null; then
-  ok "helm $(helm version --short 2>/dev/null)"
-else
-  fail "helm not found. Install from: https://helm.sh/docs/intro/install/"
-  PREREQ_FAIL=true
-fi
-
-# kubectl-argo-rollouts is a client-side kubectl plugin; the controller is
-# installed by Terraform via Helm. The plugin is only needed for the
-# `kubectl argo rollouts` convenience commands; installation continues without it.
-HAS_ARGO_PLUGIN=false
-if kubectl argo rollouts version &>/dev/null 2>&1; then
-  HAS_ARGO_PLUGIN=true
-  ok "kubectl-argo-rollouts $(kubectl argo rollouts version --short 2>/dev/null | head -1)"
-else
-  warn "kubectl-argo-rollouts plugin not found (optional)."
-  warn "  The Argo Rollouts controller is installed by Terraform via Helm."
-  warn "  Install the plugin for richer CLI commands:"
-  warn "    https://argoproj.github.io/argo-rollouts/installation/#kubectl-plugin-installation"
-fi
-
-# Docker daemon reachable
-if ! docker info &>/dev/null; then
-  fail "Docker daemon is not running. Start Docker Desktop first."
-  PREREQ_FAIL=true
-fi
-
-# Docker Hub connectivity — auto-configure registry mirrors if blocked.
-# This fixes both local docker builds and Kubernetes image pulls (both use
-# the same Docker daemon whose daemon.json we patch).
-if [[ "$DRY_RUN" == "false" ]]; then
-  if curl -sf --connect-timeout 4 --max-time 6 \
-       "https://registry-1.docker.io/v2/" >/dev/null 2>&1; then
-    ok "Docker Hub reachable"
-  else
-    warn "Docker Hub (registry-1.docker.io) is unreachable — configuring mirrors."
-    configure_registry_mirrors
-    # Verify that the daemon-level mirror works: a plain docker pull of a
-    # Docker Hub image should now succeed via the configured registry-mirrors.
-    if docker pull --quiet hello-world:latest >/dev/null 2>&1; then
-      ok "Mirror pull verified (hello-world:latest via daemon mirror)"
-      docker rmi hello-world:latest >/dev/null 2>&1 || true
-    else
-      warn "Mirror pull test failed — Helm image pulls may still fail."
-      warn "If pods stay in ImagePullBackOff, configure mirrors manually:"
-      warn "  Docker Desktop → Settings → Docker Engine → registry-mirrors"
-    fi
-  fi
-else
-  warn "[dry-run] Skipping Docker Hub connectivity check."
-fi
-
-# Docker Desktop Kubernetes reachable.
-# If Docker was just restarted above, the K8s API may need up to 2 min to recover.
-if [[ "$DOCKER_RESTARTED" == "true" ]]; then
-  log "Waiting for Kubernetes API to recover after Docker restart (up to 2 min)…"
-  k=0
-  until kubectl cluster-info --context docker-desktop &>/dev/null 2>&1; do
-    sleep 5; k=$(( k + 1 ))
-    if [[ $k -ge 24 ]]; then break; fi
-  done
-fi
-
-if ! kubectl cluster-info --context docker-desktop &>/dev/null; then
-  fail "Docker Desktop Kubernetes is not available."
-  fail "Enable it in Docker Desktop → Settings → Kubernetes → Enable Kubernetes."
-  PREREQ_FAIL=true
-else
-  ok "Docker Desktop Kubernetes cluster reachable"
-fi
-
-if [[ "$PREREQ_FAIL" == "true" ]]; then
-  fail "One or more prerequisites are missing. Fix them and re-run."
-  exit 1
-fi
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-section "STEP 2 — Build Docker Images"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-if [[ "$SKIP_IMAGES" == "true" ]]; then
-  warn "Skipping image builds (--skip-images)."
-  log "Verifying images exist locally…"
-  MISSING_IMAGES=false
+if [[ "$SKIP_BUILD" == "true" ]]; then
+  warn "SKIP_BUILD=true — skipping image builds"
   for img in svc-alpha:v1 svc-alpha:v2 svc-beta:v1 svc-beta:v2; do
-    if docker image inspect "$img" &>/dev/null; then
-      ok "$img present"
+    if docker image inspect "$img" >/dev/null 2>&1; then
+      ok "$img already present"
     else
-      fail "$img not found — run without --skip-images to build it."
-      MISSING_IMAGES=true
+      fail "$img missing — re-run without SKIP_BUILD."
+      exit 1
     fi
   done
-  if [[ "$MISSING_IMAGES" == "true" ]]; then exit 1; fi
 else
-  run bash "$REPO_ROOT/scripts/build-images.sh"
-  ok "All four images built"
+  DOCKER_MIRROR="$DOCKER_MIRROR" bash "$REPO_ROOT/scripts/build-images.sh"
 fi
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-section "STEP 3 — Terraform Bootstrap"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 4 — Helm repo sync"
+# ────────────────────────────────────────────────────────────────────────────
+# The Terraform Helm provider validates ALL repos in ~/.config/helm/repositories.yaml
+# before running any chart operation — even repos the current apply doesn't use.
+# A stale or never-cached index (e.g. kubernetes-dashboard) causes every
+# helm_release to fail with "no cached repo found".  Registering every repo
+# used by this stack and running 'helm repo update' ensures all indexes exist.
 
-log "Estimated time on first run: 10–20 minutes (downloads Helm charts + images)"
+# Remove any repos whose index cache is missing — the Helm provider fails ALL
+# helm_release resources if even one registered repo lacks a cached index file.
+# Use 'helm env' so the cache path is always correct regardless of OS/shell.
+HELM_REPO_CACHE="$(helm env HELM_REPOSITORY_CACHE 2>/dev/null | tr '\\' '/')"
+
+if [[ -n "$HELM_REPO_CACHE" ]]; then
+  while IFS= read -r repo_name; do
+    [[ -z "$repo_name" ]] && continue
+    idx_file="${HELM_REPO_CACHE}/${repo_name}-index.yaml"
+    if [[ ! -f "$idx_file" ]]; then
+      warn "Removing stale repo '${repo_name}' — missing cache: ${idx_file}"
+      helm repo remove "$repo_name" >/dev/null 2>&1 || true
+    fi
+  done < <(helm repo list -o json 2>/dev/null \
+           | python3 -c "import sys,json; [print(r['name']) for r in json.load(sys.stdin)]" \
+           2>/dev/null || true)
+fi
+
+declare -A HELM_REPOS=(
+  [ingress-nginx]="https://kubernetes.github.io/ingress-nginx"
+  [kyverno]="https://kyverno.github.io/kyverno"
+  [crossplane-stable]="https://charts.crossplane.io/stable"
+  [prometheus-community]="https://prometheus-community.github.io/helm-charts"
+  [backstage]="https://backstage.github.io/charts"
+  [argo]="https://argoproj.github.io/argo-helm"
+)
+
+for name in "${!HELM_REPOS[@]}"; do
+  helm repo add "$name" "${HELM_REPOS[$name]}" --force-update >/dev/null 2>&1 \
+    && ok "repo $name registered" \
+    || warn "repo $name add failed (continuing)"
+done
+
+log "Running helm repo update..."
+if helm repo update; then
+  ok "Helm repo cache refreshed"
+else
+  warn "helm repo update had errors — Terraform may still succeed if required repos are cached"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 5 — Terraform apply (10–20 min on first run)"
+# ────────────────────────────────────────────────────────────────────────────
 
 cd "$REPO_ROOT/terraform"
-
-run terraform init -upgrade -input=false
-run terraform apply \
+terraform init -upgrade -input=false
+terraform apply \
   -var="project_root=$REPO_ROOT" \
   -var="kyverno_enforcement_mode=$KYVERNO_MODE" \
   -auto-approve \
   -input=false
-
-ok "Terraform apply complete"
 cd "$REPO_ROOT"
+ok "Terraform apply complete"
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-section "STEP 4 — Wait for Platform Readiness"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 6 — Wait for platform readiness"
+# ────────────────────────────────────────────────────────────────────────────
 
-if [[ "$DRY_RUN" == "false" ]]; then
-  for ns in ingress-nginx kyverno crossplane-system monitoring argocd argo-rollouts backstage; do
-    wait_namespace "$ns" 300
-  done
+for ns in ingress-nginx kyverno crossplane-system monitoring argocd argo-rollouts backstage svc-alpha svc-beta; do
+  echo "  ⏳ ns/$ns"
+  if kubectl wait --for=condition=available deployment --all -n "$ns" --timeout=300s 2>/dev/null; then
+    ok "ns/$ns ready"
+  else
+    warn "ns/$ns not fully ready — inspect with: kubectl get pods -n $ns"
+  fi
+done
 
-  for ns in svc-alpha svc-beta; do
-    wait_rollout "$ns" 180
-  done
-else
-  warn "[dry-run] Skipping readiness wait."
-fi
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 7 — Endpoints"
+# ────────────────────────────────────────────────────────────────────────────
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-section "STEP 5 — Smoke Tests"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARGOCD_PWD="$(cd "$REPO_ROOT/terraform" && terraform output -raw argocd_admin_password 2>/dev/null \
+              || echo '<run: terraform output -raw argocd_admin_password>')"
 
-if [[ "$DRY_RUN" == "false" ]]; then
-  log "Running HTTP smoke tests (allow 30 s for NGINX to be ready)…"
-  sleep 30
-
-  smoke_test "svc-alpha /health"       "http://localhost/svc-alpha/health"
-  smoke_test "svc-alpha v1 /hello"     "http://localhost/svc-alpha/v1/hello"
-  smoke_test "svc-alpha v2 /hello"     "http://localhost/svc-alpha/v2/hello"
-  smoke_test "svc-beta  /health"       "http://localhost/svc-beta/health"
-  smoke_test "svc-beta  v1 /hello"     "http://localhost/svc-beta/v1/hello"
-  smoke_test "Backstage portal"        "http://localhost/backstage"
-  smoke_test "Argo CD UI"              "http://localhost/argocd"       200
-  smoke_test "Grafana UI"              "http://localhost/grafana"      302
-  smoke_test "Argo Rollouts UI"        "http://localhost/rollouts"     200
-else
-  warn "[dry-run] Skipping smoke tests."
-fi
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-section "STEP 6 — Credentials & Endpoints"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-if [[ "$DRY_RUN" == "false" ]]; then
-  ARGOCD_PWD="$(cd "$REPO_ROOT/terraform" && terraform output -raw argocd_admin_password 2>/dev/null || echo '<run: terraform output -raw argocd_admin_password>')"
-else
-  ARGOCD_PWD="<dry-run — not retrieved>"
-fi
-
-hr
 echo ""
-echo -e "  ${BOLD}Platform endpoints${NC}"
+echo -e "${BOLD}Platform endpoints${NC}"
+echo "  Backstage Portal    http://localhost/backstage"
+echo "  Argo CD             http://localhost/argocd            admin / $ARGOCD_PWD"
+echo "  Argo Rollouts UI    http://localhost/rollouts"
+echo "  Grafana             http://localhost/grafana           admin / idp-demo"
 echo ""
-echo -e "  Backstage Portal    ${GREEN}http://localhost/backstage${NC}         (no auth in demo mode)"
-echo -e "  Argo CD             ${GREEN}http://localhost/argocd${NC}            admin / ${YELLOW}${ARGOCD_PWD}${NC}"
-echo -e "  Argo Rollouts UI    ${GREEN}http://localhost/rollouts${NC}"
-echo -e "  Grafana             ${GREEN}http://localhost/grafana${NC}           admin / idp-demo"
-echo ""
-echo -e "  svc-alpha v1        ${GREEN}http://localhost/svc-alpha/v1/hello${NC}"
-echo -e "  svc-alpha v2        ${GREEN}http://localhost/svc-alpha/v2/hello${NC}"
-echo -e "  svc-beta  v1        ${GREEN}http://localhost/svc-beta/v1/hello${NC}"
-echo -e "  svc-beta  v2        ${GREEN}http://localhost/svc-beta/v2/hello${NC}"
-echo ""
-hr
-echo ""
-echo -e "  ${BOLD}Useful commands${NC}"
-echo ""
-echo -e "  Watch a canary rollout (plain kubectl — no plugin needed):"
-echo -e "    kubectl get rollout svc-alpha -n svc-alpha -w"
-if [[ "$HAS_ARGO_PLUGIN" == "true" ]]; then
-echo -e "  Or with the argo plugin (richer output):"
-echo -e "    kubectl argo rollouts get rollout svc-alpha -n svc-alpha --watch"
-fi
-echo ""
-echo -e "  Trigger a new rollout (v1 → v2):"
-echo -e "    bash $REPO_ROOT/scripts/demo.sh"
-echo ""
-echo -e "  Tear down everything:"
-echo -e "    cd $REPO_ROOT/terraform && terraform destroy -var=\"project_root=$REPO_ROOT\" -auto-approve"
-echo ""
-hr
+echo "  svc-alpha v1        http://localhost/svc-alpha/v1/hello"
+echo "  svc-alpha v2        http://localhost/svc-alpha/v2/hello"
+echo "  svc-beta  v1        http://localhost/svc-beta/v1/hello"
+echo "  svc-beta  v2        http://localhost/svc-beta/v2/hello"
 echo ""
 echo -e "${GREEN}${BOLD}Installation complete.${NC}"
 echo ""
+echo "If a URL returns 404 or hangs:"
+echo "  kubectl get pods -A | grep -vE 'Running|Completed'"
+echo "  kubectl get ingress -A"
+echo ""
+echo "Tear down everything:"
+echo "  cd $REPO_ROOT/terraform && terraform destroy \\"
+echo "    -var=\"project_root=$REPO_ROOT\" -auto-approve"

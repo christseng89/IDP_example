@@ -67,8 +67,28 @@ resource "helm_release" "nginx_ingress" {
     value = "false"
   }
 
+  # Docker Desktop assigns EXTERNAL-IP=localhost to LoadBalancer services and
+  # routes traffic through the VM transparently — hostNetwork is not needed.
+  # hostNetwork caused orphan nginx processes to hold port 80 in the VM's
+  # network namespace after pod termination, making every subsequent pod crash
+  # with "port 80 is already in use" and blocking scheduler placement.
+  set {
+    name  = "controller.replicaCount"
+    value = "1"
+  }
+
+  # Recreate (not RollingUpdate) ensures the old pod releases its ports before
+  # the replacement pod starts — safe with replicaCount=1 on a single node.
+  set {
+    name  = "controller.updateStrategy.type"
+    value = "Recreate"
+  }
+
   wait    = true
-  timeout = 300
+  # 600 s: registry.k8s.io image pull on a slow/mirrored network can take
+  # 3-5 minutes; the original 300 s caused "context deadline exceeded" before
+  # the pod ever reached Running.
+  timeout = 600
 }
 
 resource "helm_release" "kyverno" {

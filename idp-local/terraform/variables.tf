@@ -11,8 +11,9 @@ variable "kube_context" {
 }
 
 variable "project_root" {
-  description = "Absolute path to the idp-local repository root"
+  description = "Absolute path to the idp-local repository root (defaults to parent of the terraform/ directory)"
   type        = string
+  default     = ""
 }
 
 # SOC2 CC7.1 — pass Enforce for production, Audit for development environments.

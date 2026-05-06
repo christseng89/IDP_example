@@ -1,3 +1,7 @@
+locals {
+  project_root = var.project_root != "" ? var.project_root : abspath("${path.module}/..")
+}
+
 module "platform" {
   source = "./modules/platform"
 }
@@ -10,7 +14,7 @@ module "observability" {
 
 module "gitops" {
   source                   = "./modules/gitops"
-  project_root             = var.project_root
+  project_root             = local.project_root
   kyverno_enforcement_mode = var.kyverno_enforcement_mode
 
   depends_on = [module.platform]
@@ -18,7 +22,7 @@ module "gitops" {
 
 module "backstage" {
   source       = "./modules/backstage"
-  project_root = var.project_root
+  project_root = local.project_root
 
   argocd_admin_password = module.gitops.argocd_admin_password
 

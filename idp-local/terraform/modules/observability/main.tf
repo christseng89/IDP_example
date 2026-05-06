@@ -60,6 +60,10 @@ resource "helm_release" "kube_prometheus_stack" {
             memory: 128Mi
 
     grafana:
+      # Use a Docker Hub mirror to work around DNS hijacking / GFW blocking docker.io
+      image:
+        registry: docker.m.daocloud.io
+        repository: grafana/grafana
       resources:
         requests:
           cpu: 100m
@@ -73,8 +77,8 @@ resource "helm_release" "kube_prometheus_stack" {
         ingressClassName: nginx
         path: /grafana
         pathType: Prefix
-        annotations:
-          nginx.ingress.kubernetes.io/rewrite-target: /$2
+        # No rewrite-target annotation — Grafana handles the /grafana sub-path
+        # itself via grafana.ini (serve_from_sub_path + root_url) below.
         hosts:
           - localhost
       grafana.ini:
@@ -92,14 +96,10 @@ resource "helm_release" "kube_prometheus_stack" {
           cpu: 100m
           memory: 128Mi
 
+    # Disabled on Docker Desktop — host root filesystem is not exposed as
+    # shared/slave mount, which causes node-exporter to CrashLoopBackOff.
     nodeExporter:
-      resources:
-        requests:
-          cpu: 50m
-          memory: 32Mi
-        limits:
-          cpu: 100m
-          memory: 64Mi
+      enabled: false
 
     prometheusOperator:
       resources:
@@ -113,7 +113,7 @@ resource "helm_release" "kube_prometheus_stack" {
   ]
 
   wait    = true
-  timeout = 600
+  timeout = 1200
 }
 
 # Pre-built dashboard for canary traffic split visualisation

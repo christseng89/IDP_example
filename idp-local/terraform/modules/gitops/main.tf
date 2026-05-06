@@ -79,7 +79,9 @@ resource "helm_release" "argo_cd" {
         path: /argocd
         pathType: Prefix
         annotations:
-          nginx.ingress.kubernetes.io/rewrite-target: /$2
+          # Do NOT add rewrite-target here — argocd-server handles the
+          # /argocd sub-path itself via --rootpath below, and a rewrite would
+          # strip the prefix before argocd sees it, causing 404s.
           nginx.ingress.kubernetes.io/ssl-passthrough: "false"
       extraArgs:
         - --insecure
@@ -169,9 +171,10 @@ resource "helm_release" "argo_rollouts" {
         hosts:
           - localhost
         paths:
-          - /rollouts
-        pathType: Prefix
+          - /rollouts(/|$)(.*)
+        pathType: ImplementationSpecific
         annotations:
+          nginx.ingress.kubernetes.io/use-regex: "true"
           nginx.ingress.kubernetes.io/rewrite-target: /$2
   YAML
   ]
