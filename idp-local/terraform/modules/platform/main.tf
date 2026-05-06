@@ -15,19 +15,11 @@ terraform {
   }
 }
 
-# SOC2 CC7.1 — policy enforcement mode.
-# Default is Enforce (blocks non-compliant resources).
-# Set to Audit in development environments to log-only.
-variable "kyverno_enforcement_mode" {
-  description = "Kyverno validationFailureAction: Enforce blocks non-compliant resources; Audit only logs violations."
-  type        = string
-  default     = "Enforce"
-
-  validation {
-    condition     = contains(["Audit", "Enforce"], var.kyverno_enforcement_mode)
-    error_message = "kyverno_enforcement_mode must be Audit or Enforce."
-  }
-}
+# NOTE: The two Kyverno ClusterPolicies that target argoproj.io/Rollout used to
+# live here, but they fail at admission time because Kyverno tries to resolve
+# the Rollout GVK during policy creation — and the Rollout CRD is installed by
+# the gitops module, not this one. They have been moved to modules/gitops where
+# they can declare a depends_on against helm_release.argo_rollouts.
 
 resource "kubernetes_namespace" "ingress_nginx" {
   metadata { name = "ingress-nginx" }
@@ -63,6 +55,16 @@ resource "helm_release" "nginx_ingress" {
   set {
     name  = "controller.resources.limits.memory"
     value = "256Mi"
+  }
+
+  # The validating admission webhook intermittently fails to respond on
+  # Docker Desktop first installs ("context deadline exceeded" within 10 s).
+  # The webhook only validates Ingress *schema* — schema errors here are
+  # already caught client-side, so disabling it for a local demo loses no
+  # protection and removes the install-time race.
+  set {
+    name  = "controller.admissionWebhooks.enabled"
+    value = "false"
   }
 
   wait    = true
@@ -125,83 +127,8 @@ resource "helm_release" "crossplane" {
   timeout = 300
 }
 
-# Demo policy: every Rollout must carry app.kubernetes.io/version label
-resource "kubectl_manifest" "kyverno_require_version_label" {
-  yaml_body = <<-YAML
-    apiVersion: kyverno.io/v1
-    kind: ClusterPolicy
-    metadata:
-      name: require-version-label
-      annotations:
-        policies.kyverno.io/title: Require version label
-        policies.kyverno.io/description: >-
-          All Argo Rollout resources must carry the app.kubernetes.io/version
-          label so platform tooling can track which version is running.
-    spec:
-      validationFailureAction: ${var.kyverno_enforcement_mode}
-      rules:
-        - name: check-version-label
-          match:
-            any:
-              - resources:
-                  kinds:
-                    - argoproj.io/*/Rollout
-          validate:
-            message: "Rollout must have label app.kubernetes.io/version"
-            pattern:
-              metadata:
-                labels:
-                  app.kubernetes.io/version: "?*"
-  YAML
-
-  depends_on = [helm_release.kyverno]
-}
-
-# Demo policy: every Rollout pod template must have securityContext with runAsNonRoot
-resource "kubectl_manifest" "kyverno_require_security_context" {
-  yaml_body = <<-YAML
-    apiVersion: kyverno.io/v1
-    kind: ClusterPolicy
-    metadata:
-      name: require-security-context
-      annotations:
-        policies.kyverno.io/title: Require securityContext
-        policies.kyverno.io/description: >-
-          All Argo Rollout pod templates must set runAsNonRoot: true and
-          allowPrivilegeEscalation: false to prevent privilege escalation attacks.
-    spec:
-      validationFailureAction: ${var.kyverno_enforcement_mode}
-      rules:
-        - name: check-pod-security-context
-          match:
-            any:
-              - resources:
-                  kinds:
-                    - argoproj.io/*/Rollout
-          validate:
-            message: "Rollout pod template must set securityContext.runAsNonRoot: true"
-            pattern:
-              spec:
-                template:
-                  spec:
-                    securityContext:
-                      runAsNonRoot: true
-        - name: check-container-security-context
-          match:
-            any:
-              - resources:
-                  kinds:
-                    - argoproj.io/*/Rollout
-          validate:
-            message: "All containers must set allowPrivilegeEscalation: false"
-            pattern:
-              spec:
-                template:
-                  spec:
-                    containers:
-                      - securityContext:
-                          allowPrivilegeEscalation: false
-  YAML
-
-  depends_on = [helm_release.kyverno]
+# Expose the Kyverno helm release as an output so other modules (e.g. gitops)
+# can declare an explicit depends_on against it when creating ClusterPolicies.
+output "kyverno_release_name" {
+  value = helm_release.kyverno.name
 }

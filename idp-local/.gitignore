@@ -1,0 +1,13 @@
+node_modules/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+*.tar
+*.tgz
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.skill

@@ -58,6 +58,11 @@ spec:
     canary:
       canaryService: {{ .Release.Name }}-canary
       stableService: {{ .Release.Name }}-stable
+      # Drive the NGINX canary-weight annotation from the controller so
+      # setWeight values produce real traffic split (not just replica scaling).
+      trafficRouting:
+        nginx:
+          stableIngress: {{ .Release.Name }}-stable
       steps:
         - setWeight: 20
         - pause: {}

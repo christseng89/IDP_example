@@ -8,9 +8,11 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: file://${chart_path}
+    # The repo-server pod has the host repo mounted at /idp-local with .git/
+    # initialized at that root, so Argo CD can git-clone the local file:// URL.
+    repoURL: file:///idp-local
     targetRevision: HEAD
-    path: .
+    path: charts/${app_name}
     helm:
       releaseName: ${app_name}
   destination:

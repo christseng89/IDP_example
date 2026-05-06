@@ -1,7 +1,5 @@
 module "platform" {
   source = "./modules/platform"
-
-  kyverno_enforcement_mode = var.kyverno_enforcement_mode
 }
 
 module "observability" {
@@ -11,8 +9,9 @@ module "observability" {
 }
 
 module "gitops" {
-  source       = "./modules/gitops"
-  project_root = var.project_root
+  source                   = "./modules/gitops"
+  project_root             = var.project_root
+  kyverno_enforcement_mode = var.kyverno_enforcement_mode
 
   depends_on = [module.platform]
 }

@@ -15,6 +15,31 @@ terraform {
   }
 }
 
+# Translate project_root into the Docker Desktop in-pod hostPath. The variable
+# may come in as any of:
+#   - Git Bash form:   /c/Users/chris/IDP_example/idp-local
+#   - Windows form:    C:/Users/chris/IDP_example/idp-local
+#   - Backslash form:  C:\Users\chris\IDP_example\idp-local
+#   - With trailing /<dir>/..  (e.g. when applying from terraform/ with $(pwd)/..)
+# Final form must be: /run/desktop/mnt/host/c/Users/chris/IDP_example/idp-local
+locals {
+  # 1. backslashes -> forward slashes
+  _gitops_slash_path = replace(var.project_root, "\\", "/")
+
+  # 2. "C:" -> "/c"  (only if path starts with a drive letter)
+  _gitops_unix_path = (
+    can(regex("^[A-Za-z]:", local._gitops_slash_path))
+    ? "/${lower(substr(local._gitops_slash_path, 0, 1))}${substr(local._gitops_slash_path, 2, length(local._gitops_slash_path) - 2)}"
+    : local._gitops_slash_path
+  )
+
+  # 3. collapse trailing "/<segment>/.."  (apply twice to handle one nested level)
+  _gitops_no_dotdot_1 = replace(local._gitops_unix_path, "/[^/]+/\\.\\.$/", "")
+  _gitops_no_dotdot_2 = replace(local._gitops_no_dotdot_1, "/[^/]+/\\.\\.$/", "")
+
+  host_repo_path = "${var.host_repo_mount_prefix}${local._gitops_no_dotdot_2}"
+}
+
 resource "kubernetes_namespace" "argocd" {
   metadata { name = "argocd" }
 }
@@ -64,10 +89,24 @@ resource "helm_release" "argo_cd" {
       resources:
         requests:
           cpu: 100m
-          memory: 128Mi
-        limits:
-          cpu: 200m
           memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 1Gi
+      # Mount the local repo into the repo-server pod so Argo CD Applications
+      # can use `repoURL: file:///idp-local/...` instead of needing a real Git
+      # remote. This is the standard Docker Desktop pattern — the host path
+      # /run/desktop/mnt/host/<drive>/... is the in-pod view of the Windows
+      # filesystem when File Sharing is enabled in Docker Desktop.
+      volumes:
+        - name: idp-local
+          hostPath:
+            path: ${local.host_repo_path}
+            type: Directory
+      volumeMounts:
+        - name: idp-local
+          mountPath: /idp-local
+          readOnly: true
 
     applicationSet:
       resources:
@@ -175,11 +214,13 @@ data "kubernetes_secret" "argocd_initial_password" {
 }
 
 # Argo CD Application — svc-alpha
+# chart_path is no longer needed: the template uses the fixed in-pod path
+# /idp-local/charts/<app_name>, and the repo-server has the host repo mounted
+# at /idp-local (see helm_release.argo_cd above).
 resource "kubectl_manifest" "argocd_app_svc_alpha" {
   yaml_body = templatefile("${path.module}/../../templates/argocd-app.yaml.tpl", {
-    app_name   = "svc-alpha"
-    chart_path = "${var.project_root}/charts/svc-alpha"
-    namespace  = "svc-alpha"
+    app_name  = "svc-alpha"
+    namespace = "svc-alpha"
   })
 
   depends_on = [helm_release.argo_rollouts, kubernetes_namespace.svc_alpha]
@@ -188,10 +229,100 @@ resource "kubectl_manifest" "argocd_app_svc_alpha" {
 # Argo CD Application — svc-beta
 resource "kubectl_manifest" "argocd_app_svc_beta" {
   yaml_body = templatefile("${path.module}/../../templates/argocd-app.yaml.tpl", {
-    app_name   = "svc-beta"
-    chart_path = "${var.project_root}/charts/svc-beta"
-    namespace  = "svc-beta"
+    app_name  = "svc-beta"
+    namespace = "svc-beta"
   })
 
   depends_on = [helm_release.argo_rollouts, kubernetes_namespace.svc_beta]
+}
+
+# ─── Kyverno ClusterPolicies for Argo Rollouts ───────────────────────────────
+# These live here (not in modules/platform) because Kyverno's admission webhook
+# resolves the matched GVK during ClusterPolicy creation, which requires the
+# Rollout CRD to already exist. The CRD is installed by helm_release.argo_rollouts
+# above, so the policies must be created *after* it.
+#
+# Pinning to argoproj.io/v1alpha1/Rollout (rather than argoproj.io/*/Rollout)
+# avoids the wildcard-version GVR lookup which Kyverno 1.11/chart 3.1.4
+# reports as "unable to convert GVK to GVR" when CRD discovery hasn't caught up.
+
+# Demo policy: every Rollout must carry app.kubernetes.io/version label
+resource "kubectl_manifest" "kyverno_require_version_label" {
+  yaml_body = <<-YAML
+    apiVersion: kyverno.io/v1
+    kind: ClusterPolicy
+    metadata:
+      name: require-version-label
+      annotations:
+        policies.kyverno.io/title: Require version label
+        policies.kyverno.io/description: >-
+          All Argo Rollout resources must carry the app.kubernetes.io/version
+          label so platform tooling can track which version is running.
+    spec:
+      validationFailureAction: ${var.kyverno_enforcement_mode}
+      rules:
+        - name: check-version-label
+          match:
+            any:
+              - resources:
+                  kinds:
+                    - argoproj.io/v1alpha1/Rollout
+          validate:
+            message: "Rollout must have label app.kubernetes.io/version"
+            pattern:
+              metadata:
+                labels:
+                  app.kubernetes.io/version: "?*"
+  YAML
+
+  depends_on = [helm_release.argo_rollouts]
+}
+
+# Demo policy: every Rollout pod template must have securityContext with runAsNonRoot
+resource "kubectl_manifest" "kyverno_require_security_context" {
+  yaml_body = <<-YAML
+    apiVersion: kyverno.io/v1
+    kind: ClusterPolicy
+    metadata:
+      name: require-security-context
+      annotations:
+        policies.kyverno.io/title: Require securityContext
+        policies.kyverno.io/description: >-
+          All Argo Rollout pod templates must set runAsNonRoot: true and
+          allowPrivilegeEscalation: false to prevent privilege escalation attacks.
+    spec:
+      validationFailureAction: ${var.kyverno_enforcement_mode}
+      rules:
+        - name: check-pod-security-context
+          match:
+            any:
+              - resources:
+                  kinds:
+                    - argoproj.io/v1alpha1/Rollout
+          validate:
+            message: "Rollout pod template must set securityContext.runAsNonRoot: true"
+            pattern:
+              spec:
+                template:
+                  spec:
+                    securityContext:
+                      runAsNonRoot: true
+        - name: check-container-security-context
+          match:
+            any:
+              - resources:
+                  kinds:
+                    - argoproj.io/v1alpha1/Rollout
+          validate:
+            message: "All containers must set allowPrivilegeEscalation: false"
+            pattern:
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - securityContext:
+                          allowPrivilegeEscalation: false
+  YAML
+
+  depends_on = [helm_release.argo_rollouts]
 }

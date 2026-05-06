@@ -1,0 +1,18 @@
+# Force LF line endings everywhere — required because scripts/install.sh and
+# scripts/build-images.sh use bash heredocs that break with CRLF on Windows.
+* text=auto eol=lf
+
+# Keep binary files binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.zip binary
+
+# Shell scripts must be LF for Git Bash to execute them
+*.sh text eol=lf

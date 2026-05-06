@@ -180,14 +180,10 @@ resource "helm_release" "backstage" {
         - "--config"
         - "/app/app-config.yaml"
 
+    # Chart's built-in ingress only supports root path "/" — we create our own
+    # below so that NGINX can rewrite /backstage/* to / for the Backstage app.
     ingress:
-      enabled: true
-      className: nginx
-      annotations:
-        nginx.ingress.kubernetes.io/rewrite-target: /$2
-      host: localhost
-      path: /backstage(/|$)(.*)
-      pathType: Prefix
+      enabled: false
 
     serviceAccount:
       name: backstage
@@ -206,4 +202,39 @@ resource "helm_release" "backstage" {
     kubernetes_secret.backstage_k8s_token,
     kubernetes_cluster_role_binding.backstage_reader,
   ]
+}
+
+
+# Custom Ingress for Backstage with regex path + rewrite (the chart's
+# built-in ingress can only mount at "/").
+resource "kubectl_manifest" "backstage_ingress" {
+  yaml_body = <<-YAML
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: backstage
+      namespace: backstage
+      annotations:
+        nginx.ingress.kubernetes.io/use-regex: "true"
+        nginx.ingress.kubernetes.io/rewrite-target: /$2
+        # Redirect /backstage (no trailing slash) to /backstage/ so the SPA
+        # asset paths (/backstage/static/...) resolve correctly.
+        nginx.ingress.kubernetes.io/configuration-snippet: |
+          rewrite ^/backstage$ /backstage/ permanent;
+    spec:
+      ingressClassName: nginx
+      rules:
+        - host: localhost
+          http:
+            paths:
+              - path: /backstage(/|$)(.*)
+                pathType: ImplementationSpecific
+                backend:
+                  service:
+                    name: backstage
+                    port:
+                      number: 7007
+  YAML
+
+  depends_on = [helm_release.backstage]
 }
