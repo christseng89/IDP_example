@@ -1,1 +1,3 @@
 node_modules/
+idp-local/terraform/.terraform/
+.claude/settings.local.json

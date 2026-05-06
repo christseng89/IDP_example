@@ -88,6 +88,7 @@ wait_namespace() {
 }
 
 # ── Helper: wait for an Argo Rollout ─────────────────────────────────────────
+# Uses plain kubectl so the kubectl-argo-rollouts plugin is not required.
 wait_rollout() {
   local ns="$1" timeout="${2:-180}"
   local name
@@ -96,13 +97,20 @@ wait_rollout() {
     warn "No rollout found in $ns — skipping."
     return
   fi
-  log "Waiting for rollout/$name in $ns…"
-  if ! kubectl argo rollouts status "$name" -n "$ns" --timeout "${timeout}s" 2>/dev/null; then
-    warn "Rollout $name not healthy yet. Check with:"
-    warn "  kubectl argo rollouts get rollout $name -n $ns --watch"
-  else
-    ok "rollout/$name ready"
-  fi
+  log "Waiting for rollout/$name in $ns (timeout ${timeout}s)…"
+  local deadline=$(( SECONDS + timeout ))
+  while [[ $SECONDS -lt $deadline ]]; do
+    local phase
+    phase="$(kubectl get rollout "$name" -n "$ns" \
+              -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [[ "$phase" == "Healthy" || "$phase" == "Paused" ]]; then
+      ok "rollout/$name $phase"
+      return
+    fi
+    sleep 5
+  done
+  warn "rollout/$name not yet Healthy after ${timeout}s. Check with:"
+  warn "  kubectl get rollout $name -n $ns -o yaml"
 }
 
 # ── Helper: HTTP smoke test ───────────────────────────────────────────────────
@@ -117,11 +125,126 @@ smoke_test() {
   fi
 }
 
+# ── Helper: auto-configure Docker registry mirrors ────────────────────────────
+# Two-pronged fix:
+#   A) Patches daemon.json → benefits Kubernetes pod image pulls (persistent).
+#   B) Exports DOCKER_MIRROR → build-images.sh uses it immediately without
+#      waiting for a Docker Desktop restart.
+# Docker Desktop is restarted so daemon.json takes effect for K8s; if the
+# restart fails for any reason, DOCKER_MIRROR still covers the build phase.
+configure_registry_mirrors() {
+  # Always export DOCKER_MIRROR first so build-images.sh can proceed even if
+  # daemon.json patching or Docker Desktop restart fails or is slow.
+  export DOCKER_MIRROR="${DOCKER_MIRROR:-docker.m.daocloud.io}"
+
+  log "Auto-configuring Docker registry mirrors in daemon.json…"
+
+  # ── Step A: patch daemon.json ─────────────────────────────────────────────
+  local ps_patch
+  ps_patch="$(mktemp).ps1"
+
+  cat > "$ps_patch" <<'POWERSHELL'
+$daemonJson = "$env:APPDATA\Docker\daemon.json"
+$mirrors = @(
+  "https://docker.m.daocloud.io",
+  "https://dockerhub.azk8s.cn"
+)
+
+if (Test-Path $daemonJson) {
+  try   { $cfg = Get-Content $daemonJson -Raw | ConvertFrom-Json }
+  catch { $cfg = [PSCustomObject]@{} }
+} else {
+  $null = New-Item -ItemType Directory -Force -Path (Split-Path $daemonJson)
+  $cfg = [PSCustomObject]@{}
+}
+
+$existing = if ($cfg.PSObject.Properties['registry-mirrors']) {
+              [string[]]$cfg.'registry-mirrors'
+            } else { @() }
+
+$merged = @($mirrors + $existing | Select-Object -Unique)
+
+if ($cfg.PSObject.Properties['registry-mirrors']) {
+  $cfg.'registry-mirrors' = $merged
+} else {
+  $cfg | Add-Member -MemberType NoteProperty -Name 'registry-mirrors' -Value $merged
+}
+
+$cfg | ConvertTo-Json -Depth 10 | Set-Content $daemonJson -Encoding UTF8
+Write-Host "  Written  : $daemonJson"
+Write-Host "  Mirrors  : $($merged -join ', ')"
+POWERSHELL
+
+  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+       -File "$(cygpath -w "$ps_patch")" 2>&1; then
+    ok "daemon.json updated"
+  else
+    warn "daemon.json patch failed — DOCKER_MIRROR env var will cover the build phase."
+  fi
+  rm -f "$ps_patch"
+
+  # ── Step B: restart Docker Desktop so daemon.json takes effect for K8s ───
+  # Docker Desktop 4.x runs dockerd inside WSL2; com.docker.service is not the
+  # live daemon.  We must kill the full process tree and relaunch.
+  log "Restarting Docker Desktop to apply mirror settings (~45 s)…"
+
+  local ps_restart
+  ps_restart="$(mktemp).ps1"
+
+  cat > "$ps_restart" <<'POWERSHELL'
+# Kill every Docker Desktop-related process, then relaunch
+$names = @("Docker Desktop", "com.docker.backend", "com.docker.dev-envs")
+foreach ($n in $names) {
+  Get-Process $n -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      $_.CloseMainWindow() | Out-Null
+      $_ | Wait-Process -Timeout 8 -ErrorAction SilentlyContinue
+      if (-not $_.HasExited) { $_ | Stop-Process -Force -ErrorAction SilentlyContinue }
+    }
+}
+Start-Sleep -Seconds 8   # let WSL2 backend fully shut down
+
+$exe = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
+if (-not (Test-Path $exe)) {
+  $exe = Join-Path $env:LOCALAPPDATA "Programs\Docker\Docker\Docker Desktop.exe"
+}
+if (-not (Test-Path $exe)) {
+  Write-Error "Docker Desktop executable not found — restart it manually."
+  exit 1
+}
+Start-Process $exe -WindowStyle Hidden
+Write-Host "  Launched : $exe"
+POWERSHELL
+
+  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+       -File "$(cygpath -w "$ps_restart")" 2>&1; then
+    # ── Step C: wait for daemon to respond (up to 90 s) ──────────────────
+    log "Waiting for Docker daemon to become ready…"
+    local i=0
+    while ! docker info &>/dev/null 2>&1; do
+      sleep 3; i=$(( i + 1 ))
+      if [[ $i -ge 30 ]]; then
+        warn "Docker daemon did not respond within 90 s — continuing anyway."
+        break
+      fi
+    done
+    if docker info &>/dev/null 2>&1; then
+      ok "Docker Desktop restarted; registry mirrors active for K8s pulls"
+      DOCKER_RESTARTED=true
+    fi
+  else
+    warn "Docker Desktop restart failed. daemon.json is updated for the next startup."
+    warn "For K8s pod pulls to use mirrors now: right-click Docker tray → Restart."
+  fi
+  rm -f "$ps_restart"
+}
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 section "STEP 1 — Prerequisites"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 PREREQ_FAIL=false
+DOCKER_RESTARTED=false
 
 # docker, terraform support --version; kubectl and helm need their own flags
 require docker    "https://docs.docker.com/desktop/"
@@ -141,13 +264,18 @@ else
   PREREQ_FAIL=true
 fi
 
-# kubectl argo rollouts uses a different version flag
-if kubectl argo rollouts version &>/dev/null; then
+# kubectl-argo-rollouts is a client-side kubectl plugin; the controller is
+# installed by Terraform via Helm. The plugin is only needed for the
+# `kubectl argo rollouts` convenience commands; installation continues without it.
+HAS_ARGO_PLUGIN=false
+if kubectl argo rollouts version &>/dev/null 2>&1; then
+  HAS_ARGO_PLUGIN=true
   ok "kubectl-argo-rollouts $(kubectl argo rollouts version --short 2>/dev/null | head -1)"
 else
-  fail "kubectl-argo-rollouts not found. Install from:"
-  fail "  https://argoproj.github.io/argo-rollouts/installation/#kubectl-plugin-installation"
-  PREREQ_FAIL=true
+  warn "kubectl-argo-rollouts plugin not found (optional)."
+  warn "  The Argo Rollouts controller is installed by Terraform via Helm."
+  warn "  Install the plugin for richer CLI commands:"
+  warn "    https://argoproj.github.io/argo-rollouts/installation/#kubectl-plugin-installation"
 fi
 
 # Docker daemon reachable
@@ -156,7 +284,42 @@ if ! docker info &>/dev/null; then
   PREREQ_FAIL=true
 fi
 
-# Docker Desktop Kubernetes reachable
+# Docker Hub connectivity — auto-configure registry mirrors if blocked.
+# This fixes both local docker builds and Kubernetes image pulls (both use
+# the same Docker daemon whose daemon.json we patch).
+if [[ "$DRY_RUN" == "false" ]]; then
+  if curl -sf --connect-timeout 4 --max-time 6 \
+       "https://registry-1.docker.io/v2/" >/dev/null 2>&1; then
+    ok "Docker Hub reachable"
+  else
+    warn "Docker Hub (registry-1.docker.io) is unreachable — configuring mirrors."
+    configure_registry_mirrors
+    # Verify that the daemon-level mirror works: a plain docker pull of a
+    # Docker Hub image should now succeed via the configured registry-mirrors.
+    if docker pull --quiet hello-world:latest >/dev/null 2>&1; then
+      ok "Mirror pull verified (hello-world:latest via daemon mirror)"
+      docker rmi hello-world:latest >/dev/null 2>&1 || true
+    else
+      warn "Mirror pull test failed — Helm image pulls may still fail."
+      warn "If pods stay in ImagePullBackOff, configure mirrors manually:"
+      warn "  Docker Desktop → Settings → Docker Engine → registry-mirrors"
+    fi
+  fi
+else
+  warn "[dry-run] Skipping Docker Hub connectivity check."
+fi
+
+# Docker Desktop Kubernetes reachable.
+# If Docker was just restarted above, the K8s API may need up to 2 min to recover.
+if [[ "$DOCKER_RESTARTED" == "true" ]]; then
+  log "Waiting for Kubernetes API to recover after Docker restart (up to 2 min)…"
+  k=0
+  until kubectl cluster-info --context docker-desktop &>/dev/null 2>&1; do
+    sleep 5; k=$(( k + 1 ))
+    if [[ $k -ge 24 ]]; then break; fi
+  done
+fi
+
 if ! kubectl cluster-info --context docker-desktop &>/dev/null; then
   fail "Docker Desktop Kubernetes is not available."
   fail "Enable it in Docker Desktop → Settings → Kubernetes → Enable Kubernetes."
@@ -275,8 +438,12 @@ hr
 echo ""
 echo -e "  ${BOLD}Useful commands${NC}"
 echo ""
-echo -e "  Watch a canary rollout:"
+echo -e "  Watch a canary rollout (plain kubectl — no plugin needed):"
+echo -e "    kubectl get rollout svc-alpha -n svc-alpha -w"
+if [[ "$HAS_ARGO_PLUGIN" == "true" ]]; then
+echo -e "  Or with the argo plugin (richer output):"
 echo -e "    kubectl argo rollouts get rollout svc-alpha -n svc-alpha --watch"
+fi
 echo ""
 echo -e "  Trigger a new rollout (v1 → v2):"
 echo -e "    bash $REPO_ROOT/scripts/demo.sh"
