@@ -201,9 +201,19 @@ declare -A HELM_REPOS=(
 )
 
 for name in "${!HELM_REPOS[@]}"; do
-  helm repo add "$name" "${HELM_REPOS[$name]}" --force-update >/dev/null 2>&1 \
-    && ok "repo $name registered" \
-    || warn "repo $name add failed (continuing)"
+  if err=$(helm repo add "$name" "${HELM_REPOS[$name]}" --force-update 2>&1 1>/dev/null); then
+    ok "repo $name registered"
+  else
+    idx="${HELM_REPO_CACHE}/${name}-index.yaml"
+    if [[ -f "$idx" ]]; then
+      warn "repo $name add failed (cached index exists — Terraform may still succeed)"
+      warn "  Error: $err"
+    else
+      warn "repo $name add failed (no cached index — Terraform helm_release for '$name' will likely fail)"
+      warn "  Error: $err"
+      warn "  If $name is blocked, run: helm repo add $name ${HELM_REPOS[$name]} manually on a reachable network first."
+    fi
+  fi
 done
 
 log "Running helm repo update..."
