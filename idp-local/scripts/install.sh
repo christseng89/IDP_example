@@ -20,6 +20,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKER_MIRROR="${DOCKER_MIRROR:-docker.m.daocloud.io}"
 K8S_MIRROR="${K8S_MIRROR:-k8s.m.daocloud.io}"
+GHCR_MIRROR="${GHCR_MIRROR:-ghcr.m.daocloud.io}"
 KYVERNO_MODE="${KYVERNO_MODE:-Enforce}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 
@@ -94,8 +95,17 @@ HUB_IMAGES=(
   # Backstage — community image used by the chart
   "backstage/backstage:latest"
 
-  # Kyverno cleanup controller image (failing as of last run)
-  "ghcr.io/kyverno/cleanup-controller:v1.11.4"
+  # NOTE: bitnami/kubectl:1.28.5 (used by Kyverno cleanup CronJobs) left
+  # Docker Hub in Oct 2023; registry.bitnami.com is often blocked on
+  # mirrored networks.  The CronJobs are disabled in Terraform values
+  # (cleanupJobs.*.enabled=false) so this image is no longer needed.
+)
+
+# GitHub Container Registry images — pulled via GHCR_MIRROR.
+# These cannot go through the Docker Hub mirror path.
+GHCR_IMAGES=(
+  # Kyverno cleanup-controller Deployment (chart 3.1.4 / app v1.11.4)
+  "kyverno/cleanup-controller:v1.11.4"
 )
 
 prepull() {
@@ -113,8 +123,27 @@ prepull() {
   fi
 }
 
+prepull_ghcr() {
+  local img="$1"                            # e.g. kyverno/cleanup-controller:v1.11.4
+  local canonical="ghcr.io/${img}"
+  local mirrored="${GHCR_MIRROR}/${img}"
+
+  echo "  ⇣ ${mirrored}"
+  if docker pull --quiet "$mirrored" >/dev/null 2>&1; then
+    docker tag "$mirrored" "$canonical" >/dev/null 2>&1 || true
+    ok "${canonical} cached locally"
+  else
+    warn "Could not pull ${mirrored} — kubelet may fail this image."
+    warn "  Override mirror: export GHCR_MIRROR=<host> and re-run."
+  fi
+}
+
 for img in "${HUB_IMAGES[@]}"; do
   prepull "$img"
+done
+
+for img in "${GHCR_IMAGES[@]}"; do
+  prepull_ghcr "$img"
 done
 
 # ────────────────────────────────────────────────────────────────────────────

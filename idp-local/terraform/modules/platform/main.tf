@@ -115,6 +115,27 @@ resource "helm_release" "kyverno" {
     value = "64Mi"
   }
 
+  # bitnami/kubectl left Docker Hub in Oct 2023 and registry.bitnami.com is
+  # unreachable in air-gapped/mirrored networks. Disable every feature that
+  # pulls this image so installs and upgrades work without it.
+  #
+  # policyReportsCleanup: post-upgrade hook that deletes old-style policyreports
+  # (pol-* prefix) left over from Kyverno <3.x. A fresh install has none.
+  set {
+    name  = "policyReportsCleanup.enabled"
+    value = "false"
+  }
+  # cleanupJobs: CronJobs that trim AdmissionReport/ClusterAdmissionReport
+  # resources when they exceed 10 000. Never happens on a local demo cluster.
+  set {
+    name  = "cleanupJobs.admissionReports.enabled"
+    value = "false"
+  }
+  set {
+    name  = "cleanupJobs.clusterAdmissionReports.enabled"
+    value = "false"
+  }
+
   wait    = true
   timeout = 300
 }
