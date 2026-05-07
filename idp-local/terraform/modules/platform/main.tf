@@ -84,6 +84,19 @@ resource "helm_release" "nginx_ingress" {
     value = "Recreate"
   }
 
+  # Configurable host ports — default 80/443.  Override via var.http_port /
+  # var.https_port when Windows HTTP.SYS or Docker Desktop's own port-proxy
+  # already holds port 80 (all services return Go 404 instead of reaching nginx).
+  # Set HTTP_PORT=8080 before running install.sh to activate the 8080/8443 path.
+  set {
+    name  = "controller.service.ports.http"
+    value = tostring(var.http_port)
+  }
+  set {
+    name  = "controller.service.ports.https"
+    value = tostring(var.https_port)
+  }
+
   wait    = true
   # 600 s: registry.k8s.io image pull on a slow/mirrored network can take
   # 3-5 minutes; the original 300 s caused "context deadline exceeded" before

@@ -3,7 +3,9 @@ locals {
 }
 
 module "platform" {
-  source = "./modules/platform"
+  source     = "./modules/platform"
+  http_port  = var.http_port
+  https_port = var.https_port
 }
 
 module "observability" {

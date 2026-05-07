@@ -1,5 +1,6 @@
 # install.sh 功能說明
 
+**HTTP_PORT=9080 bash scripts/install.sh** for Windows
 此腳本以**七個步驟**自動完成 idp-local 本地 IDP 平台的安裝。
 
 ## 使用方式

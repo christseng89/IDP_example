@@ -23,6 +23,10 @@ K8S_MIRROR="${K8S_MIRROR:-k8s.m.daocloud.io}"
 GHCR_MIRROR="${GHCR_MIRROR:-ghcr.m.daocloud.io}"
 KYVERNO_MODE="${KYVERNO_MODE:-Enforce}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
+# Override to 8080/8443 when Windows HTTP.SYS or Docker Desktop holds port 80:
+#   HTTP_PORT=8080 bash scripts/install.sh
+HTTP_PORT="${HTTP_PORT:-80}"
+HTTPS_PORT="${HTTPS_PORT:-443}"
 
 # ── Logging helpers ──────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
@@ -57,6 +61,74 @@ if ! kubectl cluster-info --context docker-desktop >/dev/null 2>&1; then
   exit 1
 fi
 ok "Docker Desktop Kubernetes reachable"
+
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 1b — Host port availability (HTTP_PORT=${HTTP_PORT})"
+# ────────────────────────────────────────────────────────────────────────────
+# On Windows 11, HTTP.SYS (PID 4 / System) or Docker Desktop's own Go proxy
+# can hold port 80, causing ALL ingress routes to return a Go 404 instead of
+# reaching nginx.  Detect early and guide the operator to the fix.
+if command -v powershell.exe >/dev/null 2>&1; then
+  # Helper: return the PID listening on a given port, or empty string if free.
+  _port_pid() {
+    powershell.exe -NoProfile -Command \
+      "(Get-NetTCPConnection -LocalPort $1 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess" \
+      2>/dev/null | tr -d '[:space:]\r'
+  }
+  _port_proc() {
+    powershell.exe -NoProfile -Command \
+      "(Get-Process -Id $1 -ErrorAction SilentlyContinue).Name" \
+      2>/dev/null | tr -d '[:space:]\r'
+  }
+
+  port_pid=$(_port_pid "${HTTP_PORT}")
+  if [[ -n "$port_pid" && "$port_pid" =~ ^[0-9]+$ && "$port_pid" != "0" ]]; then
+    proc=$(_port_proc "$port_pid")
+    fail "Port ${HTTP_PORT} is held by PID ${port_pid} (${proc:-unknown})."
+    warn "  nginx-ingress LoadBalancer requires an unoccupied host port."
+
+    # Scan candidate ports for a free one — skip the Kubernetes NodePort range
+    # floor (30000+) to avoid confusion; try application-tier ports first.
+    CANDIDATE_PORTS=(9080 9090 9443 38080 39080)
+    FREE_PORT=""
+    for p in "${CANDIDATE_PORTS[@]}"; do
+      cand_pid=$(_port_pid "$p")
+      if [[ -z "$cand_pid" || ! "$cand_pid" =~ ^[0-9]+$ || "$cand_pid" == "0" ]]; then
+        FREE_PORT="$p"
+        break
+      fi
+    done
+
+    case "${proc:-}" in
+      com.docker.backend|docker*)
+        warn "  Docker Desktop's backend (com.docker.backend) binds ports 80 and 8080 for"
+        warn "  its Dashboard and internal API — these cannot be stopped."
+        warn "  To free port 80: open Docker Desktop → Settings → uncheck"
+        warn "  'Enable Docker Dashboard web access' (if present), then restart Docker Desktop."
+        ;;
+      W3SVC|iisexpress*)
+        warn "  IIS is holding port ${HTTP_PORT}. To release (run as Administrator):"
+        warn "    Stop-Service W3SVC; Set-Service W3SVC -StartupType Disabled"
+        warn "  Then restart Docker Desktop."
+        ;;
+      *)
+        warn "  Stop PID ${port_pid} (${proc:-unknown}) and restart Docker Desktop."
+        ;;
+    esac
+
+    if [[ -n "$FREE_PORT" ]]; then
+      warn "  → Use this confirmed-free port instead:"
+      warn "    HTTP_PORT=${FREE_PORT} bash scripts/install.sh"
+    else
+      warn "  → All scanned ports (${CANDIDATE_PORTS[*]}) are also occupied."
+      warn "    Run: netstat -ano | findstr LISTEN  to find a free port, then:"
+      warn "    HTTP_PORT=<free_port> bash scripts/install.sh"
+    fi
+    exit 1
+  else
+    ok "Port ${HTTP_PORT} available on Windows host"
+  fi
+fi
 
 # ────────────────────────────────────────────────────────────────────────────
 step "Step 2 — Pre-pull images via mirrors"
@@ -232,6 +304,8 @@ terraform init -upgrade -input=false
 terraform apply \
   -var="project_root=$REPO_ROOT" \
   -var="kyverno_enforcement_mode=$KYVERNO_MODE" \
+  -var="http_port=${HTTP_PORT}" \
+  -var="https_port=${HTTPS_PORT}" \
   -auto-approve \
   -input=false
 cd "$REPO_ROOT"
@@ -257,17 +331,24 @@ step "Step 7 — Endpoints"
 ARGOCD_PWD="$(cd "$REPO_ROOT/terraform" && terraform output -raw argocd_admin_password 2>/dev/null \
               || echo '<run: terraform output -raw argocd_admin_password>')"
 
+# Build the base URL — omit :80 so URLs look clean on standard installs.
+if [[ "$HTTP_PORT" == "80" ]]; then
+  BASE_URL="http://localhost"
+else
+  BASE_URL="http://localhost:${HTTP_PORT}"
+fi
+
 echo ""
 echo -e "${BOLD}Platform endpoints${NC}"
-echo "  Backstage Portal    http://localhost/backstage"
-echo "  Argo CD             http://localhost/argocd            admin / $ARGOCD_PWD"
-echo "  Argo Rollouts UI    http://localhost/rollouts"
-echo "  Grafana             http://localhost/grafana           admin / idp-demo"
+echo "  Backstage Portal    ${BASE_URL}/backstage"
+echo "  Argo CD             ${BASE_URL}/argocd            admin / $ARGOCD_PWD"
+echo "  Argo Rollouts UI    ${BASE_URL}/rollouts"
+echo "  Grafana             ${BASE_URL}/grafana           admin / idp-demo"
 echo ""
-echo "  svc-alpha v1        http://localhost/svc-alpha/v1/hello"
-echo "  svc-alpha v2        http://localhost/svc-alpha/v2/hello"
-echo "  svc-beta  v1        http://localhost/svc-beta/v1/hello"
-echo "  svc-beta  v2        http://localhost/svc-beta/v2/hello"
+echo "  svc-alpha v1        ${BASE_URL}/svc-alpha/v1/hello"
+echo "  svc-alpha v2        ${BASE_URL}/svc-alpha/v2/hello"
+echo "  svc-beta  v1        ${BASE_URL}/svc-beta/v1/hello"
+echo "  svc-beta  v2        ${BASE_URL}/svc-beta/v2/hello"
 echo ""
 echo -e "${GREEN}${BOLD}Installation complete.${NC}"
 echo ""
