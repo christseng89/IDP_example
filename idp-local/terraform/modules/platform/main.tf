@@ -150,7 +150,7 @@ resource "helm_release" "kyverno" {
   }
 
   wait    = true
-  timeout = 300
+  timeout = 600
 }
 
 resource "helm_release" "crossplane" {

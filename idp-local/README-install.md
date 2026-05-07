@@ -169,9 +169,11 @@ kubectl get ingress -A
 # 查看 ArgoCD Application 同步狀態
 kubectl get app -n argocd
 
-# 完整拆除平台
-cd terraform && terraform destroy \
-  -var="project_root=<REPO_ROOT>" \
-  -var="http_port=<HTTP_PORT>" \
-  -auto-approve
+# 完整拆除平台（使用專用腳本，避免 Kyverno webhook deadlock）
+bash scripts/teardown.sh
+# Windows 上若使用非預設 port：
+HTTP_PORT=9080 bash scripts/teardown.sh
 ```
+
+> **為何不直接用 `terraform destroy`？**
+> Kyverno 安裝時會建立 `ValidatingWebhookConfiguration` 和 `MutatingWebhookConfiguration`。直接執行 `terraform destroy` 時，Kubernetes 會在 Kyverno pod 終止過程中仍嘗試呼叫 webhook，但已終止的 pod 無法回應，造成死鎖（circular deadlock）——`terraform destroy` 等待 pod 終止，pod 卻因 webhook 無法回應而無法終止，最終 timeout。`teardown.sh` 會在 `terraform destroy` 前先刪除 webhook 設定，避免此問題。
