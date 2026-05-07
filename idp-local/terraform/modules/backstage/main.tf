@@ -135,7 +135,13 @@ resource "helm_release" "backstage" {
         registry: ""
         repository: idp-backstage
         tag: latest
-        pullPolicy: Never
+        # Backstage chart 1.9.4's values.schema.json restricts pullPolicy to
+        # "Always" or "IfNotPresent" — "Never" is rejected with a schema
+        # error. IfNotPresent is functionally equivalent here: Docker Desktop
+        # shares its image daemon with Kubernetes, and scripts/build-backstage.sh
+        # always builds idp-backstage:latest before this Helm release runs, so
+        # the image is present and kubelet skips the pull.
+        pullPolicy: IfNotPresent
 
       resources:
         requests:

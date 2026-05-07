@@ -100,7 +100,15 @@ COPY --from=build /app/app-config.yaml ./
 USER node
 EXPOSE 7007
 
-# Modern Backstage backend output is dist/index.cjs.js. Pointing at the
-# package directory still works because Node resolves "main" via the
-# generated package.json inside dist/.
-CMD ["node", "packages/backend", "--config", "app-config.yaml"]
+# Modern Backstage backend output is packages/backend/dist/index.cjs.js.
+#
+# Older builds shipped a packages/backend/index.js shim, so `node
+# packages/backend` resolved via Node's directory-as-module behavior. Modern
+# @backstage/cli emits only dist/, and packages/backend/package.json has no
+# "main" field — so `node packages/backend` fails with:
+#   Error: Cannot find module '/app/packages/backend'
+# (Node looks at packages/backend/package.json, finds no "main", then tries
+# packages/backend/index.js, which doesn't exist either.)
+#
+# Pointing at the compiled file directly avoids the resolver dance entirely.
+CMD ["node", "packages/backend/dist/index.cjs.js", "--config", "app-config.yaml"]

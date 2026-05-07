@@ -348,13 +348,100 @@ step "Step 5 — Terraform apply (10–20 min on first run)"
 
 cd "$REPO_ROOT/terraform"
 terraform init -upgrade -input=false
-terraform apply \
-  -var="project_root=$REPO_ROOT" \
-  -var="kyverno_enforcement_mode=$KYVERNO_MODE" \
-  -var="http_port=${HTTP_PORT}" \
-  -var="https_port=${HTTPS_PORT}" \
-  -auto-approve \
-  -input=false
+
+# Phase 1 — every kubernetes_* resource, serialized.
+#
+# The hashicorp/kubernetes provider on Windows / Docker Desktop crashes its
+# plugin process with a Go runtime fault ("traceback did not unwind
+# completely" in copystack/morestack) any time it handles more than one
+# concurrent ApplyResourceChange RPC. Symptoms in Terraform's output: "Plugin
+# did not respond" / "(*GRPCProvider).ApplyResourceChange call". Reproduced
+# on provider 2.30.0 and 2.38.0 — not a version regression, a longstanding
+# Go runtime + Windows interaction (often AV/EDR-aggravated).
+#
+# Affects ALL kubernetes_* resources, not just namespaces — e.g.
+# kubernetes_service_account, kubernetes_cluster_role, kubernetes_config_map,
+# kubernetes_secret. Helm and gavinbunney/kubectl providers are separate
+# binaries and don't have the bug, so we keep their parallelism intact.
+#
+# Workaround: Phase 1 creates every kubernetes_* resource with -parallelism=1.
+# Phase 2 runs everything else at default parallelism (10).
+#
+# If you add a new kubernetes_* resource to any module, append its address to
+# K8S_TARGETS below. Regenerate the list with:
+#   grep -rln 'resource "kubernetes_' modules/ | while read f; do
+#     mod=$(echo "$f" | sed -E 's|modules/([^/]+)/.*|\1|')
+#     grep -E '^resource "kubernetes_' "$f" \
+#       | sed -E "s|^resource \"([^\"]+)\" \"([^\"]+)\".*|module.${mod}.\1.\2|"
+#   done | sort -u
+TF_VARS=(
+  -var="project_root=$REPO_ROOT"
+  -var="kyverno_enforcement_mode=$KYVERNO_MODE"
+  -var="http_port=${HTTP_PORT}"
+  -var="https_port=${HTTPS_PORT}"
+)
+
+K8S_TARGETS=(
+  # Namespaces
+  -target='module.platform.kubernetes_namespace.ingress_nginx'
+  -target='module.platform.kubernetes_namespace.kyverno'
+  -target='module.platform.kubernetes_namespace.crossplane_system'
+  -target='module.gitops.kubernetes_namespace.argocd'
+  -target='module.gitops.kubernetes_namespace.argo_rollouts'
+  -target='module.gitops.kubernetes_namespace.svc_alpha'
+  -target='module.gitops.kubernetes_namespace.svc_beta'
+  -target='module.observability.kubernetes_namespace.monitoring'
+  -target='module.backstage.kubernetes_namespace.backstage'
+  # Backstage RBAC + config (all hit the same crash if run in parallel)
+  -target='module.backstage.kubernetes_service_account.backstage'
+  -target='module.backstage.kubernetes_cluster_role.backstage_reader'
+  -target='module.backstage.kubernetes_cluster_role_binding.backstage_reader'
+  -target='module.backstage.kubernetes_config_map.backstage_app_config'
+  -target='module.backstage.kubernetes_config_map.backstage_catalog'
+  -target='module.backstage.kubernetes_config_map.backstage_scaffolder'
+  -target='module.backstage.kubernetes_secret.backstage_argocd'
+  -target='module.backstage.kubernetes_secret.backstage_k8s_token'
+)
+
+# Retry wrapper — the kubernetes provider plugin can crash mid-apply due to
+# Go runtime GC stack-corruption faults caused by Windows AV/EDR injecting
+# hooks into the provider process ("invalid pointer found on stack" /
+# "traceback did not unwind completely"). Each crash still saves
+# already-created resources to state, so re-running continues from where it
+# stopped. Cap at 5 attempts so a genuine config error surfaces instead of
+# spinning forever.
+#
+# To eliminate the crash entirely, exclude the provider binary from your AV:
+#   Add-MpPreference -ExclusionPath "$HOME\IDP_example\idp-local\terraform\.terraform\providers\registry.terraform.io\hashicorp\kubernetes"
+#   Add-MpPreference -ExclusionProcess "terraform-provider-kubernetes_v2.30.0_x5.exe"
+apply_with_retry() {
+  local label="$1"; shift
+  local max_attempts=5
+  local attempt=1
+  while (( attempt <= max_attempts )); do
+    log "${label} (attempt ${attempt}/${max_attempts})..."
+    if terraform apply -auto-approve -input=false "$@"; then
+      return 0
+    fi
+    warn "${label} attempt ${attempt} failed (likely kubernetes provider plugin crash)."
+    if (( attempt < max_attempts )); then
+      warn "  Already-created resources are saved in state. Retrying..."
+      sleep 2
+    fi
+    attempt=$((attempt + 1))
+  done
+  fail "${label} failed after ${max_attempts} attempts. Inspect output above."
+  fail "  This is almost always Windows AV/EDR corrupting the provider's Go runtime."
+  fail "  Fix: add Defender exclusions for the provider binary (see comment above)."
+  return 1
+}
+
+apply_with_retry "Phase 1/2: creating 17 kubernetes_* resources serially" \
+  -parallelism=1 "${TF_VARS[@]}" "${K8S_TARGETS[@]}"
+ok "Kubernetes resources created"
+
+apply_with_retry "Phase 2/2: applying remaining resources (helm, kubectl_manifest, ...)" \
+  "${TF_VARS[@]}"
 cd "$REPO_ROOT"
 ok "Terraform apply complete"
 
