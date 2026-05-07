@@ -56,49 +56,51 @@ RUN yarn tsc --skipLibCheck || true
 # Step 1: build the frontend SPA (produces packages/app/dist/)
 RUN yarn workspace app build
 
-# Step 2: build backend and bundle with pre-built frontend into bundle.tar.gz
+# Step 2: compile the backend — produces packages/backend/dist/index.cjs.js
+# and dist/skeleton.tar.gz (a production package.json skeleton, unused here
+# because Stage 2 copies node_modules wholesale instead).
 RUN yarn workspace backend build
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 2: minimal runtime image. Match Stage 1's architecture — the bundle
-# we extract contains pre-compiled native .node binaries for amd64.
+# Stage 2: minimal runtime image. Match Stage 1's architecture — node_modules
+# we copy across contains pre-compiled native .node binaries for amd64.
+#
+# Modern @backstage/cli no longer produces a single bundle.tar.gz. Instead
+# `package build` emits:
+#   - packages/backend/dist/index.cjs.js   (compiled Node entry)
+#   - packages/backend/dist/skeleton.tar.gz (production package.json skeleton)
+# Rather than re-running `yarn install --production` (which would need the
+# native toolchain again and re-download the world), we simply copy node_modules
+# and the built dist/ folders from the build stage. The result is smaller and
+# faster because nothing recompiles.
 FROM --platform=linux/amd64 node:20-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production
 LABEL org.opencontainers.image.title="IDP Backstage"
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Copy hoisted node_modules (yarn workspaces hoists most deps to the root)
+COPY --from=build /app/node_modules ./node_modules
 
-# `yarn install --production` re-resolves native modules in this stage, so the
-# same toolchain is required here. Keep the install in one RUN layer and purge
-# apt lists afterwards so the runtime image stays slim.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python3 make g++ build-essential ca-certificates && \
-    ln -sf /usr/bin/python3 /usr/bin/python && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN npm config set registry https://registry.npmmirror.com && \
-    yarn config set python /usr/bin/python3
-ENV PYTHON=/usr/bin/python3
-
-# Extract the bundle (contains both backend Node.js app + frontend static files)
-COPY --from=build /app/packages/backend/dist/bundle.tar.gz ./
-RUN tar xzf bundle.tar.gz && rm bundle.tar.gz
-
-# Copy .yarnrc so production install uses the mirror too
+# Workspace manifests (needed at runtime for module resolution)
+COPY --from=build /app/package.json ./
 COPY --from=build /app/.yarnrc ./
 
-# Install production-only dependencies from the extracted package.json files.
-# No more `| tail` — surface real failures.
-RUN yarn install --production --network-timeout 1200000 --ignore-engines --no-progress
+# Frontend SPA assets — backend's app-backend plugin serves these
+COPY --from=build /app/packages/app/dist ./packages/app/dist
+COPY --from=build /app/packages/app/package.json ./packages/app/
+
+# Compiled backend + per-package node_modules (for any non-hoisted deps)
+COPY --from=build /app/packages/backend/dist ./packages/backend/dist
+COPY --from=build /app/packages/backend/package.json ./packages/backend/
 
 # Default app-config provides safe build-time defaults.
 # The runtime ConfigMap mounts the real config at /app/app-config.yaml.
 COPY --from=build /app/app-config.yaml ./
 
-# Drop privileges only after all root-required apt/install steps are done.
 USER node
 EXPOSE 7007
 
+# Modern Backstage backend output is dist/index.cjs.js. Pointing at the
+# package directory still works because Node resolves "main" via the
+# generated package.json inside dist/.
 CMD ["node", "packages/backend", "--config", "app-config.yaml"]
