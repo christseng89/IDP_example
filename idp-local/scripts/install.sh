@@ -296,6 +296,35 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
+step "Step 4b — Initialize local git repo for ArgoCD file:// access"
+# ────────────────────────────────────────────────────────────────────────────
+# ArgoCD repo-server mounts this idp-local/ directory at /idp-local in the pod
+# and clones repoURL: file:///idp-local.  That requires a .git/ at the root of
+# idp-local/ — NOT the outer IDP_example repo which owns the real .git.
+# Creating a standalone nested git repo here is safe: the outer repo treats it
+# as an embedded repository and ignores the inner .git/.
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  log "Initializing standalone git repo in $REPO_ROOT for ArgoCD..."
+  (cd "$REPO_ROOT" \
+    && git init -q \
+    && git add -A \
+    && git -c user.email="install@idp-local" -c user.name="install" \
+           commit -q --allow-empty -m "idp-local snapshot for ArgoCD")
+  ok "Standalone git repo initialized"
+else
+  pending=$(cd "$REPO_ROOT" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "${pending:-0}" -gt 0 ]]; then
+    (cd "$REPO_ROOT" \
+      && git add -A \
+      && git -c user.email="install@idp-local" -c user.name="install" \
+             commit -q --allow-empty -m "idp-local snapshot for ArgoCD")
+    ok "Standalone git repo updated (${pending} changed files committed)"
+  else
+    ok "Standalone git repo up to date"
+  fi
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
 step "Step 5 — Terraform apply (10–20 min on first run)"
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -315,13 +344,34 @@ ok "Terraform apply complete"
 step "Step 6 — Wait for platform readiness"
 # ────────────────────────────────────────────────────────────────────────────
 
-for ns in ingress-nginx kyverno crossplane-system monitoring argocd argo-rollouts backstage svc-alpha svc-beta; do
+# Terraform-managed namespaces — wait for standard Deployment readiness.
+for ns in ingress-nginx kyverno crossplane-system monitoring argocd argo-rollouts backstage; do
   echo "  ⏳ ns/$ns"
   if kubectl wait --for=condition=available deployment --all -n "$ns" --timeout=300s 2>/dev/null; then
     ok "ns/$ns ready"
   else
     warn "ns/$ns not fully ready — inspect with: kubectl get pods -n $ns"
   fi
+done
+
+# ArgoCD-managed namespaces (svc-alpha, svc-beta) use Argo Rollouts, not
+# standard Deployments — kubectl wait deployment returns immediately with no
+# resources found.  Poll until ArgoCD syncs and pods appear, then wait Ready.
+for ns in svc-alpha svc-beta; do
+  echo "  ⏳ ns/$ns (ArgoCD sync + Rollout — up to 300s)"
+  synced=false
+  for _ in $(seq 1 30); do
+    pod_count=$(kubectl get pods -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${pod_count:-0}" -gt 0 ]]; then
+      if kubectl wait pod --all -n "$ns" --for=condition=Ready --timeout=120s 2>/dev/null; then
+        ok "ns/$ns pods ready"
+        synced=true
+        break
+      fi
+    fi
+    sleep 10
+  done
+  $synced || warn "ns/$ns not ready — check: kubectl get app $ns -n argocd && kubectl get pods -n $ns"
 done
 
 # ────────────────────────────────────────────────────────────────────────────
