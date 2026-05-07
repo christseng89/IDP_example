@@ -132,10 +132,10 @@ resource "helm_release" "backstage" {
   values = [<<-YAML
     backstage:
       image:
-        registry: ghcr.io
-        repository: backstage/backstage
+        registry: ""
+        repository: idp-backstage
         tag: latest
-        pullPolicy: IfNotPresent
+        pullPolicy: Never
 
       resources:
         requests:

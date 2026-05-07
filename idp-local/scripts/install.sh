@@ -164,9 +164,6 @@ HUB_IMAGES=(
   # ArgoCD — Redis subchart from Bitnami / docker.io
   "redis:7.2.4-alpine"
 
-  # Backstage — community image used by the chart
-  "backstage/backstage:latest"
-
   # NOTE: bitnami/kubectl:1.28.5 (used by Kyverno cleanup CronJobs) left
   # Docker Hub in Oct 2023; registry.bitnami.com is often blocked on
   # mirrored networks.  The CronJobs are disabled in Terraform values
@@ -178,6 +175,7 @@ HUB_IMAGES=(
 GHCR_IMAGES=(
   # Kyverno cleanup-controller Deployment (chart 3.1.4 / app v1.11.4)
   "kyverno/cleanup-controller:v1.11.4"
+  # Backstage is built locally (idp-backstage:latest) — no pre-pull needed
 )
 
 prepull() {
@@ -219,7 +217,27 @@ for img in "${GHCR_IMAGES[@]}"; do
 done
 
 # ────────────────────────────────────────────────────────────────────────────
-step "Step 3 — Build service images (svc-alpha, svc-beta)"
+step "Step 3a — Build custom Backstage image (idp-backstage:latest)"
+# ────────────────────────────────────────────────────────────────────────────
+# The custom image bakes in the notifications plugin so the frontend DI
+# container has an implementation for notificationsApiRef at startup.
+# Docker Desktop shares the host daemon, so the image is available to
+# Kubernetes immediately without a registry push (pullPolicy: Never).
+
+if [[ "$SKIP_BUILD" == "true" ]]; then
+  warn "SKIP_BUILD=true — skipping Backstage image build"
+  if docker image inspect idp-backstage:latest >/dev/null 2>&1; then
+    ok "idp-backstage:latest already present"
+  else
+    fail "idp-backstage:latest missing — re-run without SKIP_BUILD."
+    exit 1
+  fi
+else
+  bash "$REPO_ROOT/scripts/build-backstage.sh"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 3b — Build service images (svc-alpha, svc-beta)"
 # ────────────────────────────────────────────────────────────────────────────
 
 if [[ "$SKIP_BUILD" == "true" ]]; then
