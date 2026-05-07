@@ -12,6 +12,9 @@
     "lint": "backstage-cli package lint"
   },
   "dependencies": {
+    "@backstage/core-app-api": "*",
+    "@backstage/core-components": "*",
+    "@backstage/core-plugin-api": "*",
     "@backstage/frontend-defaults": "*",
     "@backstage/plugin-catalog": "*",
     "@backstage/plugin-catalog-import": "*",
@@ -20,8 +23,13 @@
     "@backstage/plugin-scaffolder": "*",
     "@backstage/plugin-techdocs": "*",
     "@backstage/plugin-user-settings": "*",
+    "@material-ui/core": "^4.12.2",
+    "@material-ui/icons": "^4.9.1",
     "@roadiehq/backstage-plugin-argo-cd": "*",
+    "history": "^5.0.0",
     "react": "^18.0.2",
-    "react-dom": "^18.0.2"
+    "react-dom": "^18.0.2",
+    "react-router": "^6.3.0",
+    "react-router-dom": "^6.3.0"
   }
 }
