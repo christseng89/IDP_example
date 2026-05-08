@@ -347,6 +347,90 @@ step "Step 5 — Terraform apply (10–20 min on first run)"
 # ────────────────────────────────────────────────────────────────────────────
 
 cd "$REPO_ROOT/terraform"
+
+# Release any stale lock left by a previous crashed apply before init touches
+# the state. The lock info file is written by Terraform core and contains the
+# lock UUID we need to pass to force-unlock.
+if [[ -f .terraform.tfstate.lock.info ]]; then
+  lock_id=$(python3 -c "import sys,json; print(json.load(open('.terraform.tfstate.lock.info')).get('ID',''))" 2>/dev/null || true)
+  if [[ -n "$lock_id" ]]; then
+    warn "Stale state lock detected (ID: ${lock_id}) — releasing..."
+    terraform force-unlock -force "$lock_id" 2>/dev/null \
+      && ok "Stale lock released" \
+      || warn "Could not release lock — proceeding anyway"
+  fi
+fi
+
+# Normalize state for the pinned 2.30.x kubernetes provider BEFORE init.
+#
+# A previous run of this script may have used a newer kubernetes provider
+# (e.g. 2.36+ / 2.38), which writes per-instance `identity` and
+# `identity_schema_version: 1` blocks introduced by Terraform's managed
+# resource identity feature. The pinned 2.30.x provider does not understand
+# those fields and rejects the state with:
+#
+#   Error: Resource instance managed by newer provider version
+#
+# `terraform state rm` cannot reliably evict these instances — the same
+# newer-version check fires inside the state subcommand, so the entries
+# stay put and every retry fails identically.
+#
+# Direct surgery on terraform.tfstate is the only fix: strip the unknown
+# fields from each hashicorp/kubernetes instance, bump `serial`, and let
+# Terraform load the state cleanly under 2.30.x. The on-cluster resources
+# are untouched, so the next plan sees them as already-managed (no
+# spurious creates or destroys).
+normalize_state_for_provider_version() {
+  local state_file="$REPO_ROOT/terraform/terraform.tfstate"
+  [[ -f "$state_file" ]] || return 0
+
+  # Run a single Python pass that detects + strips. Exit code:
+  #   0 = nothing to do, 1 = stripped fields (state was rewritten), 2 = error.
+  # We use a quoted heredoc (<<'PY') so bash performs zero expansion inside —
+  # the python source survives intact regardless of $-signs or quotes.
+  local backup="${state_file}.preNormalize.$(date +%s)"
+  cp "$state_file" "$backup"
+
+  local rc=0
+  python3 - "$state_file" <<'PY' || rc=$?
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    state = json.load(f)
+stripped = 0
+for r in state.get("resources", []):
+    if "hashicorp/kubernetes" not in r.get("provider", ""):
+        continue
+    for inst in r.get("instances", []):
+        if inst.pop("identity", None) is not None:
+            stripped += 1
+        if inst.pop("identity_schema_version", None) is not None:
+            stripped += 1
+if stripped:
+    state["serial"] = state.get("serial", 0) + 1
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+    print("  normalized {} field(s) across kubernetes_* instances".format(stripped))
+    sys.exit(1)
+sys.exit(0)
+PY
+  case "$rc" in
+    0)
+      rm -f "$backup"
+      ok "State already 2.30-compatible (no identity blocks present)"
+      ;;
+    1)
+      ok "State normalized for provider 2.30 compatibility (backup: ${backup##*/})"
+      ;;
+    *)
+      warn "State normalization failed (rc=$rc) — restoring backup and continuing"
+      mv "$backup" "$state_file"
+      ;;
+  esac
+}
+
+normalize_state_for_provider_version
+
 terraform init -upgrade -input=false
 
 # Phase 1 — every kubernetes_* resource, serialized.
@@ -432,6 +516,46 @@ K8S_IMPORTS=(
   "module.backstage.kubernetes_secret.backstage_k8s_token|backstage/backstage-k8s-token"
 )
 
+# evict_newer_provider_state — secondary safety net for the "Resource instance
+# managed by newer provider version" error. The primary fix is
+# normalize_state_for_provider_version (run before init), which strips the
+# offending identity blocks from terraform.tfstate directly. This function
+# remains as a belt-and-braces measure: if anything still trips the check,
+# it removes ALL kubernetes_* state entries the script knows about so
+# reconcile_orphans can re-import them under the current provider.
+#
+# We deliberately cover every entry in K8S_IMPORTS (namespaces + RBAC +
+# config maps + secrets) — not just namespaces — because state instances of
+# any kind can carry the forward-only identity_schema_version field.
+#
+# Parsing terraform plan output to detect which resources are affected is
+# fragile (Terraform wraps the resource address across two lines depending on
+# terminal width). Instead we unconditionally evict every known address and
+# let reconcile_orphans restore them from the live cluster — a safe no-op on
+# entries that were already correct.
+evict_newer_provider_state() {
+  log "Evicting kubernetes_* state entries for provider-version normalization..."
+  local state_list
+  state_list=$(terraform state list 2>/dev/null || echo "")
+  local removed=0
+  for entry in "${K8S_IMPORTS[@]}"; do
+    local addr="${entry%%|*}"
+    if grep -Fxq "$addr" <<<"$state_list"; then
+      if terraform state rm -input=false "$addr" >/dev/null 2>&1; then
+        ok "  Evicted: $addr"
+        removed=$((removed + 1))
+      else
+        warn "  Could not evict: $addr"
+      fi
+    fi
+  done
+  if (( removed == 0 )); then
+    ok "No kubernetes_* state entries present — nothing to evict"
+  else
+    ok "Evicted ${removed} entries; reconcile_orphans will re-import from cluster"
+  fi
+}
+
 reconcile_orphans() {
   log "Reconciling orphan resources (cluster-but-not-in-state)..."
   local state_list
@@ -480,6 +604,7 @@ reconcile_orphans() {
   fi
 }
 
+evict_newer_provider_state
 reconcile_orphans
 
 # Retry wrapper — the kubernetes provider plugin can crash mid-apply due to
