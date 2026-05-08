@@ -25,6 +25,7 @@ module "gitops" {
 module "backstage" {
   source       = "./modules/backstage"
   project_root = local.project_root
+  http_port    = var.http_port
 
   argocd_admin_password = module.gitops.argocd_admin_password
 

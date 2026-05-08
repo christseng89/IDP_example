@@ -71,7 +71,17 @@ resource "kubernetes_config_map" "backstage_app_config" {
   }
 
   data = {
-    "app-config.yaml" = file("${var.project_root}/backstage/app-config.yaml")
+    # Template-render so the configured baseUrl matches the actual host port.
+    # Without this, Backstage's React Router compares against a hardcoded
+    # baseUrl ("http://localhost/backstage" — no port) and rejects every
+    # route as not-found, rendering its own 404 page even though the request
+    # reached the pod successfully. The "$${VAR}" form is the templatefile()
+    # escape syntax — it passes "${VAR}" through to the rendered file so
+    # Backstage's own env-var substitution still works for ARGOCD_ADMIN_PASSWORD.
+    "app-config.yaml" = templatefile(
+      "${var.project_root}/backstage/app-config.yaml",
+      { base_url = "http://localhost:${var.http_port}/backstage" }
+    )
   }
 }
 
