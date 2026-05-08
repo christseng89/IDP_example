@@ -154,20 +154,11 @@ resource "helm_release" "argo_rollouts" {
   namespace  = kubernetes_namespace.argo_rollouts.metadata[0].name
 
   values = [<<-YAML
-    # Pin both image tags to v1.7.2 — this is what scripts/install.sh
-    # pre-pulls via QUAY_MIRROR. With pullPolicy: IfNotPresent kubelet uses
-    # the locally-cached image (Docker Desktop shares the daemon) instead
-    # of dialling quay.io directly, which is slow or blocked on many
-    # corporate networks and is the #1 cause of "context deadline exceeded"
-    # on this helm_release. v1.7.2 also fixes the dashboard --rootpath bug
-    # present in v1.7.0 where some routes ignored the prefix.
-    #
-    # IMPORTANT: chart 2.37.0 templates the image reference as
+    # Chart 2.37.0 templates the image reference as
     #   {{ image.registry }}/{{ image.repository }}:{{ image.tag }}
-    # so registry MUST be set separately from repository. Putting "quay.io/"
-    # inside .repository produces "quay.io/quay.io/argoproj/..." which
-    # doesn't exist — kubelet ImagePullBackOff and helm wait times out at
-    # whatever the timeout is (15min in our case).
+    # so registry MUST be split from repository. Concatenating "quay.io/" into
+    # repository produces "quay.io/quay.io/argoproj/..." which doesn't exist
+    # and causes ImagePullBackOff -> helm wait timeout.
     controller:
       image:
         registry: quay.io
@@ -182,6 +173,12 @@ resource "helm_release" "argo_rollouts" {
           cpu: 200m
           memory: 256Mi
 
+    # Dashboard via the SAFE pattern (matches working test-rollouts/ install):
+    # no --rootpath, no probe overrides — dashboard binary keeps chart defaults
+    # (serves at "/", health check at "/healthz" on port 3100). nginx-ingress
+    # strips the /rollouts prefix on the way in via rewrite-target, so the
+    # dashboard pod sees "/". Avoids the --rootpath bug that causes
+    # CrashLoopBackOff in v1.7.x under sub-path mounting.
     dashboard:
       enabled: true
       replicas: 1
@@ -190,8 +187,6 @@ resource "helm_release" "argo_rollouts" {
         repository: argoproj/kubectl-argo-rollouts
         tag: v1.7.2
         pullPolicy: IfNotPresent
-      # Dashboard listens on containerPort 3100 by default. The chart maps
-      # service port 3100 → container 3100; ingress sends /rollouts → svc:3100.
       containerPort: 3100
       service:
         type: ClusterIP
@@ -203,40 +198,27 @@ resource "helm_release" "argo_rollouts" {
         limits:
           cpu: 200m
           memory: 256Mi
-      # Tell the dashboard binary it's mounted under /rollouts/. Available
-      # in argo-rollouts v1.7+ (chart 2.37.0+). With --rootpath, the
-      # dashboard prefixes every URL it emits with /rollouts/, so no rewrite
-      # is needed at the ingress layer — paths pass through verbatim.
-      extraArgs:
-        - --rootpath=/rollouts/
-      # When --rootpath is set, /healthz also moves under the prefix. Chart
-      # default probes hit /healthz which would now 404. Override probe paths
-      # to match the dashboard's new mount point. initialDelaySeconds is
-      # generous to absorb first-pull / cold-start delay on Docker Desktop.
-      readinessProbe:
-        httpGet:
-          path: /rollouts/healthz
-          port: dashboard
-        initialDelaySeconds: 15
-        periodSeconds: 10
-        failureThreshold: 6
-        timeoutSeconds: 5
-      livenessProbe:
-        httpGet:
-          path: /rollouts/healthz
-          port: dashboard
-        initialDelaySeconds: 60
-        periodSeconds: 30
-        failureThreshold: 3
-        timeoutSeconds: 5
+      # NOTE: deliberately NO extraArgs / readinessProbe / livenessProbe.
+      # Chart defaults handle these correctly when serving at root.
       ingress:
         enabled: true
         ingressClassName: nginx
         hosts:
           - localhost
+        # ImplementationSpecific + a regex path lets nginx-ingress capture
+        # the rest of the URL into $2 and rewrite to "/$2", so:
+        #   /rollouts        -> /
+        #   /rollouts/       -> /
+        #   /rollouts/foo    -> /foo
+        #   /rollouts/api/x  -> /api/x
         paths:
-          - /rollouts
-        pathType: Prefix
+          - /rollouts(/|$)(.*)
+        pathType: ImplementationSpecific
+        annotations:
+          nginx.ingress.kubernetes.io/rewrite-target: /$2
+          # use-regex must be "true" for ImplementationSpecific path with regex
+          nginx.ingress.kubernetes.io/use-regex: "true"
+
   YAML
   ]
 
