@@ -80,7 +80,15 @@ resource "kubernetes_config_map" "backstage_app_config" {
     # Backstage's own env-var substitution still works for ARGOCD_ADMIN_PASSWORD.
     "app-config.yaml" = templatefile(
       "${var.project_root}/backstage/app-config.yaml",
-      { base_url = "http://localhost:${var.http_port}/backstage" }
+      {
+        base_url   = "http://localhost:${var.http_port}/backstage"
+        # CORS origin must be scheme://host:port WITHOUT path. Setting it to
+        # the full base_url (with /backstage suffix) silently breaks POSTs
+        # from the frontend to the backend, including the guest auth flow
+        # — Chrome rejects the response, frontend errors out, React Router
+        # falls through to NotFoundPage rendering "dropped the mic" 404.
+        cors_origin = "http://localhost:${var.http_port}"
+      }
     )
   }
 }

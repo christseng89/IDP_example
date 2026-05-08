@@ -13,7 +13,8 @@ backend:
     client: better-sqlite3
     connection: ':memory:'
   cors:
-    origin: ${base_url}
+    # CORS origin must NOT include a path — only scheme://host:port.
+    origin: ${cors_origin}
     methods: [GET, HEAD, PATCH, POST, PUT, DELETE]
 
 integrations: {}
@@ -26,7 +27,19 @@ techdocs:
     type: local
 
 auth:
-  providers: {}
+  providers:
+    # Guest auth is the simplest provider — no IdP, no secrets. Backstage's
+    # auth-backend plugin only registers the /api/auth/guest/refresh route
+    # if this block exists; an empty providers map means the frontend's
+    # Guest sign-in card calls a 404 endpoint and rendering falls through
+    # to NotFoundPage ("Looks like someone dropped the mic!").
+    #
+    # The Dockerfile sets NODE_ENV=production, and guest auth is disabled
+    # outside development by default (Backstage assumes you'd use a real
+    # IdP in prod). Override that with dangerouslyAllowOutsideDevelopment
+    # for this local demo deployment.
+    guest:
+      dangerouslyAllowOutsideDevelopment: true
 
 catalog:
   import:

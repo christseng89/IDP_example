@@ -146,7 +146,11 @@ resource "helm_release" "argo_rollouts" {
   name       = "argo-rollouts"
   repository = "https://argoproj.github.io/argo-helm"
   chart      = "argo-rollouts"
-  version    = "2.35.1"
+  # 2.37.0 ships argo-rollouts v1.7.x, which adds the --rootpath flag the
+  # dashboard needs to be served under /rollouts/. Chart 2.35.1's v1.6.x
+  # rejected --rootpath as "unknown flag" and the SPA isn't tolerant of
+  # being mounted at a sub-path without that flag.
+  version    = "2.37.0"
   namespace  = kubernetes_namespace.argo_rollouts.metadata[0].name
 
   values = [<<-YAML
@@ -165,23 +169,32 @@ resource "helm_release" "argo_rollouts" {
         requests:
           cpu: 50m
           memory: 64Mi
-      # NOTE: argo-rollouts v1.6.x (chart 2.35.1's app version) does NOT
-      # support the --rootpath flag — the dashboard binary exits with
-      # "Error: unknown flag: --rootpath" if we pass it. That feature was
-      # added in v1.7+. To use --rootpath we'd need to bump the chart to
-      # 2.37.0 or later. For now, take the path-of-least-change approach:
-      # let nginx pass /rollouts/* through verbatim (no rewrite) and hope
-      # the dashboard SPA is tolerant of being accessed at that prefix.
-      # If the SPA still loops, the only real fix is the chart upgrade.
+      # Tell the dashboard binary it's mounted under /rollouts/. Available
+      # in argo-rollouts v1.7+ (chart 2.37.0+). With --rootpath, the
+      # dashboard prefixes every URL it emits with /rollouts/, so no rewrite
+      # is needed at the ingress layer — paths pass through verbatim.
+      extraArgs:
+        - --rootpath=/rollouts/
+      # When --rootpath is set, /healthz also moves under the prefix. Chart
+      # default probes hit /healthz which now returns 404. Override probe
+      # paths to match the dashboard's new mount point.
+      readinessProbe:
+        httpGet:
+          path: /rollouts/healthz
+          port: dashboard
+        initialDelaySeconds: 10
+        periodSeconds: 10
+      livenessProbe:
+        httpGet:
+          path: /rollouts/healthz
+          port: dashboard
+        initialDelaySeconds: 30
+        periodSeconds: 30
       ingress:
         enabled: true
         ingressClassName: nginx
         hosts:
           - localhost
-        # Prefix match without rewrite — the dashboard receives requests at
-        # /rollouts/* unchanged. Whether this works depends on whether the
-        # v1.6.x SPA emits relative URLs (works) or absolute URLs starting
-        # with / (doesn't work — leads to 404s on assets).
         paths:
           - /rollouts
         pathType: Prefix
