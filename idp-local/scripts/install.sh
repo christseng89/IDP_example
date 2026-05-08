@@ -21,6 +21,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKER_MIRROR="${DOCKER_MIRROR:-docker.m.daocloud.io}"
 K8S_MIRROR="${K8S_MIRROR:-k8s.m.daocloud.io}"
 GHCR_MIRROR="${GHCR_MIRROR:-ghcr.m.daocloud.io}"
+# quay.io hosts Argo CD, Argo Rollouts, Prometheus operator/server,
+# Alertmanager, node-exporter — all of which kubelet pulls during install.
+# A reachable quay.io mirror is the difference between a 5-minute install and
+# a 5-minute helm timeout ("context deadline exceeded") on networks that
+# block or throttle quay.io directly.
+QUAY_MIRROR="${QUAY_MIRROR:-quay.m.daocloud.io}"
 KYVERNO_MODE="${KYVERNO_MODE:-Enforce}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 # Override to 8080/8443 when Windows HTTP.SYS or Docker Desktop holds port 80:
@@ -178,6 +184,27 @@ GHCR_IMAGES=(
   # Backstage is built locally (idp-backstage:latest) — no pre-pull needed
 )
 
+# quay.io images — pulled via QUAY_MIRROR and retagged to quay.io. Tags below
+# are the defaults baked into the Helm chart versions pinned in this repo:
+#   - argo-cd chart 6.7.3        → argocd v2.10.7
+#   - argo-rollouts chart 2.37.0 → argo-rollouts / kubectl-argo-rollouts v1.7.0
+#   - kube-prometheus-stack 57.2.0 → prometheus-operator v0.72.0,
+#                                    prometheus v2.51.0, alertmanager v0.27.0,
+#                                    config-reloader v0.72.0, node-exporter v1.7.0
+# If a chart version is bumped, the matching tag here usually needs updating
+# too — but a tag mismatch only degrades to "kubelet pulls from quay.io
+# directly", it does not cause the install to fail.
+QUAY_IMAGES=(
+  "argoproj/argocd:v2.10.7"
+  "argoproj/argo-rollouts:v1.7.0"
+  "argoproj/kubectl-argo-rollouts:v1.7.0"
+  "prometheus-operator/prometheus-operator:v0.72.0"
+  "prometheus-operator/prometheus-config-reloader:v0.72.0"
+  "prometheus/prometheus:v2.51.0"
+  "prometheus/alertmanager:v0.27.0"
+  "prometheus/node-exporter:v1.7.0"
+)
+
 prepull() {
   local img="$1"
   local mirrored="${DOCKER_MIRROR}/${img}"
@@ -208,12 +235,34 @@ prepull_ghcr() {
   fi
 }
 
+prepull_quay() {
+  local img="$1"                            # e.g. argoproj/argo-rollouts:v1.7.0
+  local canonical="quay.io/${img}"
+  local mirrored="${QUAY_MIRROR}/${img}"
+
+  echo "  ⇣ ${mirrored}"
+  if docker pull --quiet "$mirrored" >/dev/null 2>&1; then
+    docker tag "$mirrored" "$canonical" >/dev/null 2>&1 || true
+    ok "${canonical} cached locally"
+  else
+    # Soft failure — kubelet may still reach quay.io directly. The mirror
+    # mismatch (e.g. tag bumped in the chart but not in this list) shouldn't
+    # break the install, just slow it down on first pull.
+    warn "Could not pull ${mirrored} — kubelet will try quay.io directly."
+    warn "  If quay.io is also blocked, override mirror: export QUAY_MIRROR=<host>"
+  fi
+}
+
 for img in "${HUB_IMAGES[@]}"; do
   prepull "$img"
 done
 
 for img in "${GHCR_IMAGES[@]}"; do
   prepull_ghcr "$img"
+done
+
+for img in "${QUAY_IMAGES[@]}"; do
+  prepull_quay "$img"
 done
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -290,27 +339,107 @@ declare -A HELM_REPOS=(
   [argo]="https://argoproj.github.io/argo-helm"
 )
 
+# Per-repo URL overrides via env, e.g.:
+#   PROMETHEUS_COMMUNITY_REPO_URL=https://my-mirror/helm-charts bash scripts/install.sh
+# Hyphens in the repo name become underscores; the result is uppercased and
+# suffixed with _REPO_URL.
 for name in "${!HELM_REPOS[@]}"; do
-  if err=$(helm repo add "$name" "${HELM_REPOS[$name]}" --force-update 2>&1 1>/dev/null); then
-    ok "repo $name registered"
-  else
-    idx="${HELM_REPO_CACHE}/${name}-index.yaml"
-    if [[ -f "$idx" ]]; then
-      warn "repo $name add failed (cached index exists — Terraform may still succeed)"
-      warn "  Error: $err"
-    else
-      warn "repo $name add failed (no cached index — Terraform helm_release for '$name' will likely fail)"
-      warn "  Error: $err"
-      warn "  If $name is blocked, run: helm repo add $name ${HELM_REPOS[$name]} manually on a reachable network first."
+  env_var="${name//-/_}"
+  env_var="${env_var^^}_REPO_URL"
+  override="${!env_var:-}"
+  if [[ -n "$override" ]]; then
+    warn "Using URL override for $name: $override"
+    HELM_REPOS[$name]="$override"
+  fi
+done
+
+# register_helm_repo — robust replacement for `helm repo add`. Three tiers:
+#
+#   1. helm repo add, retried up to 3 times with linear backoff. Resolves
+#      transient GitHub Pages timeouts that throw "context deadline exceeded".
+#   2. If still failing, fetch `<repo>/index.yaml` directly via curl and
+#      drop it into the helm cache. curl honours HTTP_PROXY/HTTPS_PROXY
+#      and has its own --retry, so corporate proxies and slow links work
+#      where helm's internal HTTP client gives up. After the file is in
+#      place we re-run `helm repo add` once so repositories.yaml is updated.
+#   3. If even curl can't reach the URL, surface a clear remediation hint
+#      and continue — the script must not abort here, because some
+#      operators run with SKIP_BUILD/cached state and don't need every repo.
+#
+# Returns 0 if the repo is usable (helm has a cached index), 1 otherwise.
+register_helm_repo() {
+  local name="$1" url="$2"
+  local cache_file="${HELM_REPO_CACHE}/${name}-index.yaml"
+  local attempt=0 max=3 err=""
+
+  while (( attempt < max )); do
+    attempt=$((attempt + 1))
+    if err=$(helm repo add "$name" "$url" --force-update 2>&1 1>/dev/null); then
+      ok "repo $name registered (helm repo add, attempt $attempt)"
+      return 0
     fi
+    if (( attempt < max )); then
+      warn "repo $name add failed (attempt $attempt/$max) — retrying in $((attempt * 5))s"
+    fi
+    sleep $((attempt * 5))
+  done
+
+  warn "repo $name: helm repo add failed after $max attempts"
+  warn "  Last error: $err"
+
+  # Fallback: download index.yaml directly via curl.
+  if command -v curl >/dev/null 2>&1; then
+    log "Falling back to direct index.yaml download for '$name'..."
+    mkdir -p "$HELM_REPO_CACHE" 2>/dev/null || true
+    if curl -fsSL --retry 5 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 30 --max-time 180 \
+            -o "$cache_file" "${url%/}/index.yaml" 2>/dev/null; then
+      # Now register the repo entry in repositories.yaml without forcing a
+      # network round-trip — `helm repo add` will overwrite the cache file
+      # we just wrote, so we re-write it from a temp copy after.
+      local tmp_idx="${cache_file}.curl.tmp"
+      cp "$cache_file" "$tmp_idx"
+      helm repo add "$name" "$url" --force-update >/dev/null 2>&1 || true
+      if [[ ! -s "$cache_file" ]]; then
+        cp "$tmp_idx" "$cache_file"
+      fi
+      rm -f "$tmp_idx"
+      if [[ -s "$cache_file" ]]; then
+        ok "repo $name registered (curl-cached index, ${url%/}/index.yaml)"
+        return 0
+      fi
+    fi
+    warn "  curl could not reach ${url%/}/index.yaml either"
+  fi
+
+  fail "repo $name unreachable — Terraform helm_release for '$name' will fail"
+  warn "  Workarounds:"
+  local upper="${name//-/_}"; upper="${upper^^}"
+  warn "    1. Use a mirror URL: export ${upper}_REPO_URL=<reachable_url>"
+  warn "    2. Set a proxy:      export HTTPS_PROXY=<proxy_url> HTTP_PROXY=<proxy_url>"
+  warn "    3. Cache manually on a reachable network and copy"
+  warn "       ${cache_file##*/} into ${HELM_REPO_CACHE}/"
+  return 1
+}
+
+failed_repos=()
+for name in "${!HELM_REPOS[@]}"; do
+  if ! register_helm_repo "$name" "${HELM_REPOS[$name]}"; then
+    failed_repos+=("$name")
   fi
 done
 
 log "Running helm repo update..."
-if helm repo update; then
+if helm repo update 2>/dev/null; then
   ok "Helm repo cache refreshed"
 else
   warn "helm repo update had errors — Terraform may still succeed if required repos are cached"
+fi
+
+if (( ${#failed_repos[@]} > 0 )); then
+  warn "${#failed_repos[@]} helm repo(s) unreachable: ${failed_repos[*]}"
+  warn "  Terraform helm_release resources that depend on these will fail."
+  warn "  Re-run install.sh after fixing connectivity (see hints above)."
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -380,9 +509,19 @@ fi
 # Terraform load the state cleanly under 2.30.x. The on-cluster resources
 # are untouched, so the next plan sees them as already-managed (no
 # spurious creates or destroys).
+# Set to "true" by normalize_state_for_provider_version when the state was
+# either already compatible OR successfully rewritten. evict_newer_provider_state
+# checks this flag and skips its work entirely in that case — saves us from
+# emitting misleading "Could not evict" warnings when terraform state rm
+# returns non-zero on perfectly healthy state entries.
+STATE_NORMALIZED="false"
+
 normalize_state_for_provider_version() {
   local state_file="$REPO_ROOT/terraform/terraform.tfstate"
-  [[ -f "$state_file" ]] || return 0
+  if [[ ! -f "$state_file" ]]; then
+    STATE_NORMALIZED="true"
+    return 0
+  fi
 
   # Run a single Python pass that detects + strips. Exit code:
   #   0 = nothing to do, 1 = stripped fields (state was rewritten), 2 = error.
@@ -392,39 +531,71 @@ normalize_state_for_provider_version() {
   cp "$state_file" "$backup"
 
   local rc=0
+  # Python protocol: 0 = no work needed (state already clean),
+  #                  1 = state was rewritten,
+  #                  2 = error (e.g. JSON parse failure on a corrupted state).
+  # Wrap the body in try/except so a Python exception exits with rc=2
+  # rather than the default rc=1, which would otherwise be indistinguishable
+  # from "successfully normalized" in the case statement below.
+  #
+  # Robustness — tfstate corruption recovery: on Windows, interrupted writes
+  # leave terraform.tfstate padded with NUL bytes (\x00) after the trailing
+  # `}`. python's json.load then errors with "Extra data". We handle this by
+  # reading as bytes, trimming trailing NULs / whitespace, and decoding as
+  # UTF-8 — recovering the original valid JSON without any data loss.
   python3 - "$state_file" <<'PY' || rc=$?
 import json, sys
-path = sys.argv[1]
-with open(path) as f:
-    state = json.load(f)
-stripped = 0
-for r in state.get("resources", []):
-    if "hashicorp/kubernetes" not in r.get("provider", ""):
-        continue
-    for inst in r.get("instances", []):
-        if inst.pop("identity", None) is not None:
-            stripped += 1
-        if inst.pop("identity_schema_version", None) is not None:
-            stripped += 1
-if stripped:
-    state["serial"] = state.get("serial", 0) + 1
-    with open(path, "w") as f:
-        json.dump(state, f, indent=2)
-    print("  normalized {} field(s) across kubernetes_* instances".format(stripped))
-    sys.exit(1)
-sys.exit(0)
+try:
+    path = sys.argv[1]
+    with open(path, "rb") as f:
+        raw = f.read()
+    trimmed = raw.rstrip(b"\x00 \t\r\n")
+    if len(trimmed) < len(raw):
+        print("  trimmed {} trailing NUL/whitespace byte(s) from corrupted state".format(
+            len(raw) - len(trimmed)))
+    state = json.loads(trimmed.decode("utf-8"))
+    stripped = 0
+    for r in state.get("resources", []):
+        if "hashicorp/kubernetes" not in r.get("provider", ""):
+            continue
+        for inst in r.get("instances", []):
+            if inst.pop("identity", None) is not None:
+                stripped += 1
+            if inst.pop("identity_schema_version", None) is not None:
+                stripped += 1
+    # Rewrite if we stripped fields OR if we trimmed corruption (always
+    # heal a NUL-padded state file even if no identity blocks were present).
+    needs_write = bool(stripped) or (len(trimmed) < len(raw))
+    if needs_write:
+        state["serial"] = state.get("serial", 0) + 1
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        msg = []
+        if stripped:
+            msg.append("normalized {} field(s) across kubernetes_* instances".format(stripped))
+        if len(trimmed) < len(raw):
+            msg.append("recovered NUL-padded state")
+        print("  " + "; ".join(msg))
+        sys.exit(1)
+    sys.exit(0)
+except Exception as e:
+    print("  state normalization error: {}".format(e), file=sys.stderr)
+    sys.exit(2)
 PY
   case "$rc" in
     0)
       rm -f "$backup"
       ok "State already 2.30-compatible (no identity blocks present)"
+      STATE_NORMALIZED="true"
       ;;
     1)
       ok "State normalized for provider 2.30 compatibility (backup: ${backup##*/})"
+      STATE_NORMALIZED="true"
       ;;
     *)
       warn "State normalization failed (rc=$rc) — restoring backup and continuing"
       mv "$backup" "$state_file"
+      STATE_NORMALIZED="false"
       ;;
   esac
 }
@@ -534,6 +705,16 @@ K8S_IMPORTS=(
 # let reconcile_orphans restore them from the live cluster — a safe no-op on
 # entries that were already correct.
 evict_newer_provider_state() {
+  # Skip entirely if normalize_state_for_provider_version already produced
+  # a clean state. terraform state rm returns non-zero on entries that the
+  # provider considers healthy (the operation is treated as a no-op error),
+  # which would otherwise emit "Could not evict" warnings for every entry
+  # despite nothing actually being wrong.
+  if [[ "$STATE_NORMALIZED" == "true" ]]; then
+    ok "State already normalized — skipping evict (no provider-version mismatch)"
+    return 0
+  fi
+
   log "Evicting kubernetes_* state entries for provider-version normalization..."
   local state_list
   state_list=$(terraform state list 2>/dev/null || echo "")
