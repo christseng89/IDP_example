@@ -154,7 +154,18 @@ resource "helm_release" "argo_rollouts" {
   namespace  = kubernetes_namespace.argo_rollouts.metadata[0].name
 
   values = [<<-YAML
+    # Pin both image tags to v1.7.2 — this is what scripts/install.sh
+    # pre-pulls via QUAY_MIRROR. With pullPolicy: IfNotPresent kubelet uses
+    # the locally-cached image (Docker Desktop shares the daemon) instead
+    # of dialling quay.io directly, which is slow or blocked on many
+    # corporate networks and is the #1 cause of "context deadline exceeded"
+    # on this helm_release. v1.7.2 also fixes the dashboard --rootpath bug
+    # present in v1.7.0 where some routes ignored the prefix.
     controller:
+      image:
+        repository: quay.io/argoproj/argo-rollouts
+        tag: v1.7.2
+        pullPolicy: IfNotPresent
       resources:
         requests:
           cpu: 100m
@@ -165,10 +176,24 @@ resource "helm_release" "argo_rollouts" {
 
     dashboard:
       enabled: true
+      replicas: 1
+      image:
+        repository: quay.io/argoproj/kubectl-argo-rollouts
+        tag: v1.7.2
+        pullPolicy: IfNotPresent
+      # Dashboard listens on containerPort 3100 by default. The chart maps
+      # service port 3100 → container 3100; ingress sends /rollouts → svc:3100.
+      containerPort: 3100
+      service:
+        type: ClusterIP
+        port: 3100
       resources:
         requests:
           cpu: 50m
           memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
       # Tell the dashboard binary it's mounted under /rollouts/. Available
       # in argo-rollouts v1.7+ (chart 2.37.0+). With --rootpath, the
       # dashboard prefixes every URL it emits with /rollouts/, so no rewrite
@@ -176,20 +201,25 @@ resource "helm_release" "argo_rollouts" {
       extraArgs:
         - --rootpath=/rollouts/
       # When --rootpath is set, /healthz also moves under the prefix. Chart
-      # default probes hit /healthz which now returns 404. Override probe
-      # paths to match the dashboard's new mount point.
+      # default probes hit /healthz which would now 404. Override probe paths
+      # to match the dashboard's new mount point. initialDelaySeconds is
+      # generous to absorb first-pull / cold-start delay on Docker Desktop.
       readinessProbe:
         httpGet:
           path: /rollouts/healthz
           port: dashboard
-        initialDelaySeconds: 10
+        initialDelaySeconds: 15
         periodSeconds: 10
+        failureThreshold: 6
+        timeoutSeconds: 5
       livenessProbe:
         httpGet:
           path: /rollouts/healthz
           port: dashboard
-        initialDelaySeconds: 30
+        initialDelaySeconds: 60
         periodSeconds: 30
+        failureThreshold: 3
+        timeoutSeconds: 5
       ingress:
         enabled: true
         ingressClassName: nginx
@@ -201,8 +231,10 @@ resource "helm_release" "argo_rollouts" {
   YAML
   ]
 
+  # 900s (15min) gives slow networks room to pull both images on first
+  # install. With pre-pulled images the helm install completes in <60s.
   wait    = true
-  timeout = 300
+  timeout = 900
 
   depends_on = [helm_release.argo_cd]
 }

@@ -196,6 +196,11 @@ GHCR_IMAGES=(
 # directly", it does not cause the install to fail.
 QUAY_IMAGES=(
   "argoproj/argocd:v2.10.7"
+  # argo-rollouts: pin to v1.7.2 (matches modules/gitops/main.tf). v1.7.2
+  # ships dashboard --rootpath fixes that v1.7.0 lacked. Pre-pull v1.7.0 as
+  # well in case state already has v1.7.0 from a prior install.
+  "argoproj/argo-rollouts:v1.7.2"
+  "argoproj/kubectl-argo-rollouts:v1.7.2"
   "argoproj/argo-rollouts:v1.7.0"
   "argoproj/kubectl-argo-rollouts:v1.7.0"
   "prometheus-operator/prometheus-operator:v0.72.0"
@@ -339,6 +344,20 @@ declare -A HELM_REPOS=(
   [argo]="https://argoproj.github.io/argo-helm"
 )
 
+# CDN fallback URLs for repos hosted on GitHub Pages. jsdelivr serves any
+# GitHub branch's contents at https://cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>
+# and has strong China connectivity, so it works on networks where direct
+# *.github.io is throttled or blocked. The published Helm repos all live on
+# the gh-pages branch — both index.yaml and chart .tgz files are reachable
+# through the same prefix, no rewriting needed.
+declare -A HELM_REPO_CDN_FALLBACK=(
+  [ingress-nginx]="https://cdn.jsdelivr.net/gh/kubernetes/ingress-nginx@gh-pages"
+  [kyverno]="https://cdn.jsdelivr.net/gh/kyverno/kyverno@gh-pages"
+  [prometheus-community]="https://cdn.jsdelivr.net/gh/prometheus-community/helm-charts@gh-pages"
+  [backstage]="https://cdn.jsdelivr.net/gh/backstage/charts@gh-pages"
+  [argo]="https://cdn.jsdelivr.net/gh/argoproj/argo-helm@gh-pages"
+)
+
 # Per-repo URL overrides via env, e.g.:
 #   PROMETHEUS_COMMUNITY_REPO_URL=https://my-mirror/helm-charts bash scripts/install.sh
 # Hyphens in the repo name become underscores; the result is uppercased and
@@ -353,50 +372,34 @@ for name in "${!HELM_REPOS[@]}"; do
   fi
 done
 
-# register_helm_repo — robust replacement for `helm repo add`. Three tiers:
-#
-#   1. helm repo add, retried up to 3 times with linear backoff. Resolves
-#      transient GitHub Pages timeouts that throw "context deadline exceeded".
-#   2. If still failing, fetch `<repo>/index.yaml` directly via curl and
-#      drop it into the helm cache. curl honours HTTP_PROXY/HTTPS_PROXY
-#      and has its own --retry, so corporate proxies and slow links work
-#      where helm's internal HTTP client gives up. After the file is in
-#      place we re-run `helm repo add` once so repositories.yaml is updated.
-#   3. If even curl can't reach the URL, surface a clear remediation hint
-#      and continue — the script must not abort here, because some
-#      operators run with SKIP_BUILD/cached state and don't need every repo.
-#
-# Returns 0 if the repo is usable (helm has a cached index), 1 otherwise.
-register_helm_repo() {
-  local name="$1" url="$2"
+# try_register_one — single-URL attempt: 3× helm repo add with backoff,
+# then direct curl of <url>/index.yaml into the helm cache. Returns 0 on
+# success (cache populated), 1 on failure. Helper for register_helm_repo.
+try_register_one() {
+  local name="$1" url="$2" tag="$3"
   local cache_file="${HELM_REPO_CACHE}/${name}-index.yaml"
   local attempt=0 max=3 err=""
 
   while (( attempt < max )); do
     attempt=$((attempt + 1))
     if err=$(helm repo add "$name" "$url" --force-update 2>&1 1>/dev/null); then
-      ok "repo $name registered (helm repo add, attempt $attempt)"
+      ok "repo $name registered (${tag}, helm repo add, attempt $attempt)"
       return 0
     fi
     if (( attempt < max )); then
-      warn "repo $name add failed (attempt $attempt/$max) — retrying in $((attempt * 5))s"
+      warn "repo $name (${tag}) add failed (attempt $attempt/$max) — retrying in $((attempt * 5))s"
     fi
     sleep $((attempt * 5))
   done
-
-  warn "repo $name: helm repo add failed after $max attempts"
+  warn "repo $name (${tag}): helm repo add failed after $max attempts"
   warn "  Last error: $err"
 
-  # Fallback: download index.yaml directly via curl.
   if command -v curl >/dev/null 2>&1; then
-    log "Falling back to direct index.yaml download for '$name'..."
+    log "Trying direct index.yaml download for '$name' (${tag})..."
     mkdir -p "$HELM_REPO_CACHE" 2>/dev/null || true
     if curl -fsSL --retry 5 --retry-delay 5 --retry-connrefused \
             --connect-timeout 30 --max-time 180 \
             -o "$cache_file" "${url%/}/index.yaml" 2>/dev/null; then
-      # Now register the repo entry in repositories.yaml without forcing a
-      # network round-trip — `helm repo add` will overwrite the cache file
-      # we just wrote, so we re-write it from a temp copy after.
       local tmp_idx="${cache_file}.curl.tmp"
       cp "$cache_file" "$tmp_idx"
       helm repo add "$name" "$url" --force-update >/dev/null 2>&1 || true
@@ -405,17 +408,47 @@ register_helm_repo() {
       fi
       rm -f "$tmp_idx"
       if [[ -s "$cache_file" ]]; then
-        ok "repo $name registered (curl-cached index, ${url%/}/index.yaml)"
+        ok "repo $name registered (${tag}, curl-cached index, ${url%/}/index.yaml)"
         return 0
       fi
     fi
     warn "  curl could not reach ${url%/}/index.yaml either"
+  fi
+  return 1
+}
+
+# register_helm_repo — four-tier fallback:
+#   Tier 1+2: try the primary URL (helm repo add with retries, then curl).
+#   Tier 3:   if a CDN fallback is registered (jsdelivr → gh-pages branch),
+#             retry the same recipe against the CDN URL. Works on networks
+#             where direct *.github.io is throttled/blocked.
+#   Tier 4:   surface clear remediation hints. Caller decides whether to
+#             abort or proceed (script aborts if any repo fails, with copy-
+#             paste recovery commands).
+# Returns 0 if the repo is usable (helm has a cached index), 1 otherwise.
+register_helm_repo() {
+  local name="$1" url="$2"
+  local cache_file="${HELM_REPO_CACHE}/${name}-index.yaml"
+
+  if try_register_one "$name" "$url" "primary"; then
+    return 0
+  fi
+
+  local cdn="${HELM_REPO_CDN_FALLBACK[$name]:-}"
+  if [[ -n "$cdn" && "$cdn" != "$url" ]]; then
+    log "Trying CDN fallback for '$name': $cdn"
+    if try_register_one "$name" "$cdn" "CDN"; then
+      return 0
+    fi
   fi
 
   fail "repo $name unreachable — Terraform helm_release for '$name' will fail"
   warn "  Workarounds:"
   local upper="${name//-/_}"; upper="${upper^^}"
   warn "    1. Use a mirror URL: export ${upper}_REPO_URL=<reachable_url>"
+  if [[ -n "$cdn" ]]; then
+    warn "       (suggested: ${upper}_REPO_URL=$cdn)"
+  fi
   warn "    2. Set a proxy:      export HTTPS_PROXY=<proxy_url> HTTP_PROXY=<proxy_url>"
   warn "    3. Cache manually on a reachable network and copy"
   warn "       ${cache_file##*/} into ${HELM_REPO_CACHE}/"
@@ -437,9 +470,41 @@ else
 fi
 
 if (( ${#failed_repos[@]} > 0 )); then
-  warn "${#failed_repos[@]} helm repo(s) unreachable: ${failed_repos[*]}"
-  warn "  Terraform helm_release resources that depend on these will fail."
-  warn "  Re-run install.sh after fixing connectivity (see hints above)."
+  echo
+  fail "═══════════════════════════════════════════════════════════════════"
+  fail "  ${#failed_repos[@]} helm repo(s) unreachable: ${failed_repos[*]}"
+  fail "  Terraform will spin in retry hell (5×5min apply cycles) before"
+  fail "  failing the same way every time. Aborting now to save 25 minutes."
+  fail "═══════════════════════════════════════════════════════════════════"
+  echo
+  fail "  Pick ONE of these recovery commands and re-run install.sh:"
+  echo
+  for r in "${failed_repos[@]}"; do
+    upper="${r//-/_}"; upper="${upper^^}"
+    cdn="${HELM_REPO_CDN_FALLBACK[$r]:-}"
+    if [[ -n "$cdn" ]]; then
+      fail "    # ${r}: jsdelivr CDN mirror (works on most blocked networks)"
+      fail "    export ${upper}_REPO_URL=$cdn"
+    else
+      fail "    # ${r}: this repo has no GitHub Pages CDN fallback;"
+      fail "    # use a corporate proxy or download index.yaml manually."
+    fi
+  done
+  echo
+  fail "  Then:    bash scripts/install.sh"
+  echo
+  fail "  Or, if you have a proxy:"
+  fail "    export HTTPS_PROXY=http://your.proxy:port"
+  fail "    export HTTP_PROXY=http://your.proxy:port"
+  fail "    bash scripts/install.sh"
+  echo
+  fail "  Set SKIP_HELM_REPO_CHECK=true to override and proceed anyway"
+  fail "  (only useful if helm_release resources are already in state)."
+  echo
+  if [[ "${SKIP_HELM_REPO_CHECK:-false}" != "true" ]]; then
+    exit 2
+  fi
+  warn "SKIP_HELM_REPO_CHECK=true — proceeding despite unreachable repos."
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -911,3 +976,11 @@ echo ""
 echo "Tear down everything:"
 echo "  cd $REPO_ROOT/terraform && terraform destroy \\"
 echo "    -var=\"project_root=$REPO_ROOT\" -auto-approve"
+echo "If a URL returns 404 or hangs:"
+echo "  kubectl get pods -A | grep -vE 'Running|Completed'"
+echo "  kubectl get ingress -A"
+echo ""
+echo "Tear down everything:"
+echo "  cd $REPO_ROOT/terraform && terraform destroy \\"
+echo "    -var=\"project_root=$REPO_ROOT\" -auto-approve"
+pprove"

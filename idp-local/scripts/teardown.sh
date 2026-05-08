@@ -72,6 +72,7 @@ fi
 cd "$REPO_ROOT/terraform"
 
 if timeout "${NGINX_TIMEOUT}" terraform destroy \
+     -parallelism=1 \
      -var="http_port=${HTTP_PORT}" \
      -var="https_port=${HTTPS_PORT}" \
      -target='module.platform.helm_release.nginx_ingress' \
@@ -138,6 +139,7 @@ done
 cd "$REPO_ROOT/terraform"
 
 if timeout "${CROSSPLANE_TIMEOUT}" terraform destroy \
+     -parallelism=1 \
      -var="http_port=${HTTP_PORT}" \
      -var="https_port=${HTTPS_PORT}" \
      -target='module.platform.helm_release.crossplane' \
@@ -210,6 +212,7 @@ KYVERNO_TIMEOUT=60  # seconds — see NGINX_TIMEOUT comment.
 cd "$REPO_ROOT/terraform"
 
 if timeout "${KYVERNO_TIMEOUT}" terraform destroy \
+     -parallelism=1 \
      -var="http_port=${HTTP_PORT}" \
      -var="https_port=${HTTPS_PORT}" \
      -target='module.platform.helm_release.kyverno' \
@@ -270,15 +273,42 @@ else
 fi
 cd "$REPO_ROOT"
 
-step "Step 6 — Terraform destroy"
+step "Step 6 — Terraform destroy (parallelism=1, retry on plugin crash)"
+# The hashicorp/kubernetes provider crashes its plugin process on Windows
+# (Go runtime fault from AV/EDR injection) when handling concurrent
+# ApplyResourceChange RPCs. Same issue as install.sh — same fix:
+# -parallelism=1 (one resource at a time) plus a retry wrapper that
+# resumes from already-destroyed state on each attempt. Five attempts
+# matches install.sh; on first install/teardown most crashes happen on
+# the first attempt and resolve on the second.
 cd "$REPO_ROOT/terraform"
-log "Running: terraform destroy -var=http_port=${HTTP_PORT} -var=https_port=${HTTPS_PORT} --auto-approve"
-terraform destroy \
-  -var="http_port=${HTTP_PORT}" \
-  -var="https_port=${HTTPS_PORT}" \
-  --auto-approve
+
+destroy_with_retry() {
+  local max_attempts=5 attempt=1
+  while (( attempt <= max_attempts )); do
+    log "Running terraform destroy (attempt ${attempt}/${max_attempts}, parallelism=1)..."
+    if terraform destroy \
+         -parallelism=1 \
+         -var="http_port=${HTTP_PORT}" \
+         -var="https_port=${HTTPS_PORT}" \
+         --auto-approve; then
+      return 0
+    fi
+    warn "  attempt ${attempt} failed (likely kubernetes provider plugin crash)."
+    if (( attempt < max_attempts )); then
+      warn "  Already-destroyed resources are saved in state. Retrying in 3s..."
+      sleep 3
+    fi
+    attempt=$((attempt + 1))
+  done
+  err "  terraform destroy failed after ${max_attempts} attempts."
+  err "  Inspect output above. Falling through to Step 7 to clean orphan CRDs."
+  return 1
+}
+
+destroy_with_retry || true
 cd "$REPO_ROOT"
-ok "Terraform destroy complete"
+ok "Terraform destroy phase complete"
 
 step "Step 7 — Delete orphaned CRDs (kept by Helm resource policy)"
 # ArgoCD and Argo Rollouts charts annotate their CRDs with
