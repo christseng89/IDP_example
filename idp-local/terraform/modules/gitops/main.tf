@@ -213,9 +213,36 @@ resource "helm_release" "argo_rollouts" {
         ingressClassName: nginx
         hosts:
           - localhost
+        # /rollouts → dashboard SPA + assets (via dashboard's own /rollouts/*
+        #             route; relative asset URLs in index.html resolve fine
+        #             under this prefix).
+        # /api      → dashboard API + SSE streams. Without --rootpath the
+        #             SPA's JS bundle calls absolute /api/v1/* paths. We
+        #             route those to the same service so the SPA can load
+        #             namespace/rollout data AND subscribe to live updates
+        #             via /api/v1/stream/rollouts/<ns>/info (Server-Sent
+        #             Events). Safe because no other app owns /api/* at
+        #             root (Argo CD's API is at /argocd/api/* via its own
+        #             --rootpath).
         paths:
           - /rollouts
+          - /api
         pathType: Prefix
+        annotations:
+          # SSE streaming for the rollouts dashboard requires:
+          #   - proxy-buffering OFF: nginx must forward bytes as they arrive
+          #     instead of buffering. Without this, the SPA subscribes to
+          #     /api/v1/stream/... and the connection hangs forever waiting
+          #     for the first event ("Loading..." stuck on the rollouts
+          #     table even when curl can fetch the data).
+          #   - long read/send timeouts so the SSE connection isn't reset
+          #     after the default 60s of "no new events".
+          #   - HTTP/1.1 explicitly so nginx keeps the connection alive
+          #     (HTTP/1.0 would close after each response).
+          nginx.ingress.kubernetes.io/proxy-buffering: "off"
+          nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+          nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+          nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
 
   YAML
   ]
