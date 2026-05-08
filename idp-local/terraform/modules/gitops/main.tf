@@ -165,17 +165,26 @@ resource "helm_release" "argo_rollouts" {
         requests:
           cpu: 50m
           memory: 64Mi
+      # NOTE: argo-rollouts v1.6.x (chart 2.35.1's app version) does NOT
+      # support the --rootpath flag — the dashboard binary exits with
+      # "Error: unknown flag: --rootpath" if we pass it. That feature was
+      # added in v1.7+. To use --rootpath we'd need to bump the chart to
+      # 2.37.0 or later. For now, take the path-of-least-change approach:
+      # let nginx pass /rollouts/* through verbatim (no rewrite) and hope
+      # the dashboard SPA is tolerant of being accessed at that prefix.
+      # If the SPA still loops, the only real fix is the chart upgrade.
       ingress:
         enabled: true
         ingressClassName: nginx
         hosts:
           - localhost
+        # Prefix match without rewrite — the dashboard receives requests at
+        # /rollouts/* unchanged. Whether this works depends on whether the
+        # v1.6.x SPA emits relative URLs (works) or absolute URLs starting
+        # with / (doesn't work — leads to 404s on assets).
         paths:
-          - /rollouts(/|$)(.*)
-        pathType: ImplementationSpecific
-        annotations:
-          nginx.ingress.kubernetes.io/use-regex: "true"
-          nginx.ingress.kubernetes.io/rewrite-target: /$2
+          - /rollouts
+        pathType: Prefix
   YAML
   ]
 

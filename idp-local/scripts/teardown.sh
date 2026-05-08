@@ -56,7 +56,10 @@ step "Step 3 — Bounded nginx-ingress teardown (3 min cap, then force-delete)"
 # Ingress create/update/delete elsewhere in the cluster. Strategy mirrors
 # Step 5 (Kyverno): remove the webhook first, attempt targeted destroy with
 # a 180s cap, then fall back to force-delete the namespace.
-NGINX_TIMEOUT=180  # seconds
+NGINX_TIMEOUT=60  # seconds — short fuse: graceful helm uninstall consistently
+                   # crashes the provider on Windows due to AV/EDR injection,
+                   # so wait 1 minute then go straight to force-delete instead
+                   # of burning a 3-minute timer for every teardown.
 
 # Remove the admission webhook so it can't reject anything mid-teardown.
 # (The webhook also has a -admission ValidatingWebhookConfiguration variant
@@ -90,7 +93,7 @@ else
     if kubectl get ns ingress-nginx >/dev/null 2>&1; then
       warn "Namespace still Terminating; clearing spec.finalizers..."
       kubectl get ns ingress-nginx -o json \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))" \
+        | python3 -c "import json,sys,signal; signal.signal(signal.SIGPIPE,signal.SIG_DFL) if hasattr(signal,'SIGPIPE') else None; d=json.load(sys.stdin); d['spec']['finalizers']=[]; sys.stdout.write(json.dumps(d)); sys.stdout.flush()" 2>/dev/null \
         | kubectl replace --raw "/api/v1/namespaces/ingress-nginx/finalize" -f - >/dev/null 2>&1 || true
     fi
     ok "Namespace ingress-nginx force-deleted"
@@ -118,7 +121,7 @@ step "Step 4 — Bounded crossplane teardown (3 min cap, then force-delete)"
 # Crossplane also installs ValidatingWebhookConfiguration and
 # MutatingWebhookConfiguration objects that can reject API calls during the
 # teardown if their backing service is gone. Strip them first.
-CROSSPLANE_TIMEOUT=180  # seconds
+CROSSPLANE_TIMEOUT=60  # seconds — see NGINX_TIMEOUT comment.
 
 # Remove Crossplane admission webhooks before anything else.
 for wh in $(kubectl get validatingwebhookconfiguration -o name 2>/dev/null \
@@ -175,7 +178,7 @@ else
     if kubectl get ns crossplane-system >/dev/null 2>&1; then
       warn "Namespace still Terminating; clearing spec.finalizers..."
       kubectl get ns crossplane-system -o json \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))" \
+        | python3 -c "import json,sys,signal; signal.signal(signal.SIGPIPE,signal.SIG_DFL) if hasattr(signal,'SIGPIPE') else None; d=json.load(sys.stdin); d['spec']['finalizers']=[]; sys.stdout.write(json.dumps(d)); sys.stdout.flush()" 2>/dev/null \
         | kubectl replace --raw "/api/v1/namespaces/crossplane-system/finalize" -f - >/dev/null 2>&1 || true
     fi
     ok "Namespace crossplane-system force-deleted"
@@ -202,7 +205,7 @@ step "Step 5 — Bounded Kyverno teardown (3 min cap, then force-delete)"
 # is what `kubectl delete ns --force` actually requires to make progress)
 # and remove the resources from terraform state so the main destroy in
 # Step 6 doesn't try to delete them again.
-KYVERNO_TIMEOUT=180  # seconds
+KYVERNO_TIMEOUT=60  # seconds — see NGINX_TIMEOUT comment.
 
 cd "$REPO_ROOT/terraform"
 
@@ -252,7 +255,7 @@ else
     if kubectl get ns kyverno >/dev/null 2>&1; then
       warn "Namespace still Terminating; clearing spec.finalizers..."
       kubectl get ns kyverno -o json \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))" \
+        | python3 -c "import json,sys,signal; signal.signal(signal.SIGPIPE,signal.SIG_DFL) if hasattr(signal,'SIGPIPE') else None; d=json.load(sys.stdin); d['spec']['finalizers']=[]; sys.stdout.write(json.dumps(d)); sys.stdout.flush()" 2>/dev/null \
         | kubectl replace --raw "/api/v1/namespaces/kyverno/finalize" -f - >/dev/null 2>&1 || true
     fi
     ok "Namespace kyverno force-deleted"

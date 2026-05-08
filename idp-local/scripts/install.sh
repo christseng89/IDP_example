@@ -505,6 +505,18 @@ apply_with_retry() {
     warn "${label} attempt ${attempt} failed (likely kubernetes provider plugin crash)."
     if (( attempt < max_attempts )); then
       warn "  Already-created resources are saved in state. Retrying..."
+      # CRITICAL: reconcile orphans between retry attempts.
+      #
+      # When the plugin crashes mid-create, the resource lands on the cluster
+      # BUT terraform never gets the success response and doesn't write it to
+      # state. The next attempt then plans a "create" for that resource and
+      # fails with "<kind> already exists". Without this re-reconcile,
+      # subsequent retries are guaranteed to fail the same way and burn all
+      # 5 attempts on the same orphan.
+      #
+      # Re-importing here means attempt N+1 sees the orphan in state and
+      # plans an "update in place" (or no-op) instead of "create".
+      reconcile_orphans
       sleep 2
     fi
     attempt=$((attempt + 1))
