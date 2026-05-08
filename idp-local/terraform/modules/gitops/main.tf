@@ -173,12 +173,22 @@ resource "helm_release" "argo_rollouts" {
           cpu: 200m
           memory: 256Mi
 
-    # Dashboard via the SAFE pattern (matches working test-rollouts/ install):
-    # no --rootpath, no probe overrides — dashboard binary keeps chart defaults
-    # (serves at "/", health check at "/healthz" on port 3100). nginx-ingress
-    # strips the /rollouts prefix on the way in via rewrite-target, so the
-    # dashboard pod sees "/". Avoids the --rootpath bug that causes
-    # CrashLoopBackOff in v1.7.x under sub-path mounting.
+    # Dashboard at /rollouts via VERBATIM forwarding (no --rootpath, no
+    # rewrite). Why each piece is the way it is:
+    #
+    # * NO --rootpath flag: in v1.7.2 the dashboard binary CrashLoopBackOffs
+    #   when this is set under Docker Desktop. Confirmed empirically.
+    #
+    # * NO probe overrides: chart defaults probe /healthz at port 3100, which
+    #   the binary serves regardless of mount path. Overriding to
+    #   /rollouts/healthz returns 404 and causes the pod to be killed.
+    #
+    # * Ingress is Prefix /rollouts with NO rewrite-target: the dashboard
+    #   binary already has a built-in SPA route at /rollouts (it's the
+    #   rollouts list page). Forwarding the URL verbatim — browser hits
+    #   /rollouts/foo, dashboard gets /rollouts/foo, dashboard serves the
+    #   SPA — avoids the redirect loop you get when nginx strips the prefix
+    #   (dashboard would 302 / -> /rollouts and the browser would loop back).
     dashboard:
       enabled: true
       replicas: 1
@@ -198,26 +208,14 @@ resource "helm_release" "argo_rollouts" {
         limits:
           cpu: 200m
           memory: 256Mi
-      # NOTE: deliberately NO extraArgs / readinessProbe / livenessProbe.
-      # Chart defaults handle these correctly when serving at root.
       ingress:
         enabled: true
         ingressClassName: nginx
         hosts:
           - localhost
-        # ImplementationSpecific + a regex path lets nginx-ingress capture
-        # the rest of the URL into $2 and rewrite to "/$2", so:
-        #   /rollouts        -> /
-        #   /rollouts/       -> /
-        #   /rollouts/foo    -> /foo
-        #   /rollouts/api/x  -> /api/x
         paths:
-          - /rollouts(/|$)(.*)
-        pathType: ImplementationSpecific
-        annotations:
-          nginx.ingress.kubernetes.io/rewrite-target: /$2
-          # use-regex must be "true" for ImplementationSpecific path with regex
-          nginx.ingress.kubernetes.io/use-regex: "true"
+          - /rollouts
+        pathType: Prefix
 
   YAML
   ]
