@@ -161,9 +161,17 @@ resource "helm_release" "argo_rollouts" {
     # corporate networks and is the #1 cause of "context deadline exceeded"
     # on this helm_release. v1.7.2 also fixes the dashboard --rootpath bug
     # present in v1.7.0 where some routes ignored the prefix.
+    #
+    # IMPORTANT: chart 2.37.0 templates the image reference as
+    #   {{ image.registry }}/{{ image.repository }}:{{ image.tag }}
+    # so registry MUST be set separately from repository. Putting "quay.io/"
+    # inside .repository produces "quay.io/quay.io/argoproj/..." which
+    # doesn't exist — kubelet ImagePullBackOff and helm wait times out at
+    # whatever the timeout is (15min in our case).
     controller:
       image:
-        repository: quay.io/argoproj/argo-rollouts
+        registry: quay.io
+        repository: argoproj/argo-rollouts
         tag: v1.7.2
         pullPolicy: IfNotPresent
       resources:
@@ -178,7 +186,8 @@ resource "helm_release" "argo_rollouts" {
       enabled: true
       replicas: 1
       image:
-        repository: quay.io/argoproj/kubectl-argo-rollouts
+        registry: quay.io
+        repository: argoproj/kubectl-argo-rollouts
         tag: v1.7.2
         pullPolicy: IfNotPresent
       # Dashboard listens on containerPort 3100 by default. The chart maps
