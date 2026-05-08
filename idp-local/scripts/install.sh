@@ -403,6 +403,85 @@ K8S_TARGETS=(
   -target='module.backstage.kubernetes_secret.backstage_k8s_token'
 )
 
+# Reconcile orphan resources — when the provider plugin crashes mid-create,
+# the resource lands in the cluster but never makes it into terraform state.
+# The next apply then tries to create it again and fails with
+# "<kind> 'X' already exists". This loop walks each kubernetes_* target,
+# checks whether it exists on the cluster but is missing from state, and
+# imports it if so. Safe to run on a clean install (every check fails fast).
+#
+# Format: "<terraform-address>|<cluster-id>". For namespaced resources the
+# cluster-id is "<namespace>/<name>"; for cluster-scoped it's just "<name>".
+K8S_IMPORTS=(
+  "module.platform.kubernetes_namespace.ingress_nginx|ingress-nginx"
+  "module.platform.kubernetes_namespace.kyverno|kyverno"
+  "module.platform.kubernetes_namespace.crossplane_system|crossplane-system"
+  "module.gitops.kubernetes_namespace.argocd|argocd"
+  "module.gitops.kubernetes_namespace.argo_rollouts|argo-rollouts"
+  "module.gitops.kubernetes_namespace.svc_alpha|svc-alpha"
+  "module.gitops.kubernetes_namespace.svc_beta|svc-beta"
+  "module.observability.kubernetes_namespace.monitoring|monitoring"
+  "module.backstage.kubernetes_namespace.backstage|backstage"
+  "module.backstage.kubernetes_service_account.backstage|backstage/backstage"
+  "module.backstage.kubernetes_cluster_role.backstage_reader|backstage-reader"
+  "module.backstage.kubernetes_cluster_role_binding.backstage_reader|backstage-reader"
+  "module.backstage.kubernetes_config_map.backstage_app_config|backstage/backstage-app-config"
+  "module.backstage.kubernetes_config_map.backstage_catalog|backstage/backstage-catalog"
+  "module.backstage.kubernetes_config_map.backstage_scaffolder|backstage/backstage-scaffolder"
+  "module.backstage.kubernetes_secret.backstage_argocd|backstage/backstage-argocd"
+  "module.backstage.kubernetes_secret.backstage_k8s_token|backstage/backstage-k8s-token"
+)
+
+reconcile_orphans() {
+  log "Reconciling orphan resources (cluster-but-not-in-state)..."
+  local state_list
+  state_list=$(terraform state list 2>/dev/null || echo "")
+  local imported=0
+  local checked=0
+  for entry in "${K8S_IMPORTS[@]}"; do
+    local addr="${entry%%|*}"
+    local cid="${entry##*|}"
+    checked=$((checked + 1))
+    # Already in state — skip.
+    if grep -Fxq "$addr" <<<"$state_list"; then
+      continue
+    fi
+    # Determine whether the resource exists on the cluster. Resource kind is
+    # parsed from the terraform address (kubernetes_<kind>).
+    local kind
+    kind=$(sed -E 's|.*\.kubernetes_([^.]+)\..*|\1|' <<<"$addr")
+    local exists=false
+    case "$kind" in
+      namespace)
+        kubectl get ns "$cid" >/dev/null 2>&1 && exists=true ;;
+      service_account|config_map|secret)
+        local ns="${cid%%/*}" name="${cid##*/}"
+        # config_map → configmap, service_account → serviceaccount
+        local k="${kind//_/}"
+        kubectl get "$k" "$name" -n "$ns" >/dev/null 2>&1 && exists=true ;;
+      cluster_role)
+        kubectl get clusterrole "$cid" >/dev/null 2>&1 && exists=true ;;
+      cluster_role_binding)
+        kubectl get clusterrolebinding "$cid" >/dev/null 2>&1 && exists=true ;;
+    esac
+    if $exists; then
+      if terraform import -input=false "${TF_VARS[@]}" "$addr" "$cid" >/dev/null 2>&1; then
+        ok "Imported orphan: $addr ($cid)"
+        imported=$((imported + 1))
+      else
+        warn "Found orphan $cid on cluster but import failed for $addr"
+      fi
+    fi
+  done
+  if (( imported == 0 )); then
+    ok "No orphan kubernetes resources detected (${checked} checked)"
+  else
+    ok "Reconciled ${imported} orphan resource(s)"
+  fi
+}
+
+reconcile_orphans
+
 # Retry wrapper — the kubernetes provider plugin can crash mid-apply due to
 # Go runtime GC stack-corruption faults caused by Windows AV/EDR injecting
 # hooks into the provider process ("invalid pointer found on stack" /

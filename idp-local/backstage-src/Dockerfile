@@ -74,28 +74,69 @@ RUN yarn workspace backend build
 # and the built dist/ folders from the build stage. The result is smaller and
 # faster because nothing recompiles.
 FROM --platform=linux/amd64 node:20-bookworm-slim
-WORKDIR /app
 ENV NODE_ENV=production
 LABEL org.opencontainers.image.title="IDP Backstage"
 
+# Don't use WORKDIR on /app because it creates the dir with mode 700 (root-only)
+# when it doesn't exist, and WORKDIR happens before RUN. Instead:
+# 1. Create /app with correct permissions before any COPY
+# 2. Use RUN cd /app or explicit paths in COPY
+# Cache-bust: 2025-05-08-fix-v3
+RUN mkdir -p /app && chown node:node /app && chmod 755 /app
+
 # Copy hoisted node_modules (yarn workspaces hoists most deps to the root)
-COPY --from=build /app/node_modules ./node_modules
+# Use --chown=node:node on every COPY to set ownership at copy time. This is
+# O(1) metadata per COPY operation — vastly faster than a post-COPY
+# `chown -R /app` (which on Backstage's ~300k-file node_modules takes 5-15 min
+# on Docker Desktop's overlay FS on Windows). We never need a recursive chown.
+COPY --from=build --chown=node:node /app/node_modules /app/node_modules
 
 # Workspace manifests (needed at runtime for module resolution)
-COPY --from=build /app/package.json ./
-COPY --from=build /app/.yarnrc ./
+COPY --from=build --chown=node:node /app/package.json /app/
+COPY --from=build --chown=node:node /app/.yarnrc /app/
 
 # Frontend SPA assets — backend's app-backend plugin serves these
-COPY --from=build /app/packages/app/dist ./packages/app/dist
-COPY --from=build /app/packages/app/package.json ./packages/app/
+COPY --from=build --chown=node:node /app/packages/app/dist /app/packages/app/dist
+COPY --from=build --chown=node:node /app/packages/app/package.json /app/packages/app/
 
-# Compiled backend + per-package node_modules (for any non-hoisted deps)
-COPY --from=build /app/packages/backend/dist ./packages/backend/dist
-COPY --from=build /app/packages/backend/package.json ./packages/backend/
+# Compiled backend output. `yarn workspace backend build` produces:
+#   packages/backend/dist/bundle.tar.gz   — entry + sourcemap (only ~2 KB)
+#   packages/backend/dist/skeleton.tar.gz — production package.json skeleton
+# bundle.tar.gz extracts to packages/backend/dist/index.cjs.js (a 628-byte
+# loader stub that calls require('@backstage/backend-defaults') — all real
+# backend code lives in /app/node_modules). skeleton.tar.gz is only needed
+# when running `yarn install --production` fresh in the runtime stage, which
+# we skip because we copy node_modules wholesale.
+COPY --from=build --chown=node:node /app/packages/backend/dist /app/packages/backend/dist
+COPY --from=build --chown=node:node /app/packages/backend/package.json /app/packages/backend/
+RUN cd /app && set -eux \
+    && tar -xzf packages/backend/dist/bundle.tar.gz \
+    && rm packages/backend/dist/bundle.tar.gz \
+       packages/backend/dist/skeleton.tar.gz \
+    # Make extracted files node-owned (tar runs as root, so it creates
+    # root-owned files — we only need to chown the freshly-extracted dist
+    # subtree, NOT all of /app). This is fast: dist/ has 2 files, vs
+    # node_modules with ~300k files (which is already node-owned via
+    # COPY --chown above).
+    && chown -R node:node packages/backend/dist \
+    && ls -la packages/backend/dist/index.cjs.js
 
 # Default app-config provides safe build-time defaults.
 # The runtime ConfigMap mounts the real config at /app/app-config.yaml.
-COPY --from=build /app/app-config.yaml ./
+COPY --from=build --chown=node:node /app/app-config.yaml /app/
+
+# Defensive: ensure intermediate directories under /app are traversable.
+# BuildKit's COPY --chown can occasionally leave auto-created intermediate
+# directories (/app/packages/, /app/packages/app/, etc.) with restrictive
+# modes. Touch only directories, depth-capped to 5 so we never recurse into
+# node_modules — runs in milliseconds, not the 5-15 minutes that a recursive
+# chmod over 300k node_modules files would take.
+RUN find /app -maxdepth 5 -type d -exec chmod 755 {} +
+
+# WORKDIR sets the runtime cwd. Without this the container starts with
+# cwd=/, and CMD's relative paths resolve against / instead of /app —
+# Node then fails with "Cannot find module '/packages/backend/dist/...'".
+WORKDIR /app
 
 USER node
 EXPOSE 7007

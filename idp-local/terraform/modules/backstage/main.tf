@@ -182,6 +182,19 @@ resource "helm_release" "backstage" {
           subPath: template.yaml
           readOnly: true
 
+      # The Backstage chart 1.9.4 deployment template hardcodes
+      #   command: ["node", "packages/backend"]
+      # which OVERRIDES whatever CMD is set in the Docker image. With modern
+      # @backstage/cli, packages/backend has no index.js and its package.json
+      # has no "main" field — Node fails with:
+      #   Error: Cannot find module '/app/packages/backend'
+      # Override command here to point at the compiled entry directly. Patching
+      # the Dockerfile alone is not sufficient: Kubernetes uses the chart's
+      # command, not the image's CMD.
+      command:
+        - "node"
+        - "packages/backend/dist/index.cjs.js"
+
       args:
         - "--config"
         - "/app/app-config.yaml"
