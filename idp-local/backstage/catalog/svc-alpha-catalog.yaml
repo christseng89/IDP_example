@@ -5,7 +5,6 @@ metadata:
   title: Service Alpha
   description: Primary IDP demo service. Calls svc-beta. Demonstrates canary rollout from v1 to v2.
   annotations:
-    backstage.io/techdocs-ref: dir:.
     argocd/app-name: svc-alpha
     backstage.io/kubernetes-id: svc-alpha
     prometheus.io/scrape: "true"
@@ -32,6 +31,8 @@ spec:
     - component:svc-beta
   providesApis:
     - svc-alpha-api
+  consumesApis:
+    - svc-beta-api
 ---
 apiVersion: backstage.io/v1alpha1
 kind: API
@@ -84,6 +85,4 @@ spec:
                       version: { type: string, example: v2 }
                       service: { type: string, example: svc-alpha }
                       message: { type: string, example: "Hello from v2" }
-                      timestamp: { type: string, format: date-time }
-                      requestId: { type: string, format: uuid }
-                      downstream: { type: string }
+              

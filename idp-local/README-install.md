@@ -247,6 +247,32 @@ ipconfig /flushdns
 
 常見原因:`idp-local/` 缺少 `.git/` 目錄,ArgoCD 無法 `git clone file:///idp-local`。**Step 4b** 已自動修復此問題。
 
+### 瀏覽器 console 出現大量「A listener indicated an asynchronous response by returning true」錯誤
+
+```
+:9080/catalog?...:1 Uncaught (in promise) Error: A listener indicated an asynchronous
+response by returning true, but the message channel closed before a response was received
+```
+
+**這不是 Backstage 或 IDP 平台的 bug,而是 Chrome 擴充功能(AdBlock Plus、AdBlock 等)的已知雜訊。**
+
+技術原因:擴充功能的 content script 註冊了 `chrome.runtime.onMessage` listener 並 `return true`(表示「我會非同步回應」),但 channel 關閉前沒有 `sendResponse`,Chrome 因而印出這條警告。任何裝有這類擴充的 Chrome 都會在**所有網站**上看到同樣訊息。
+
+**驗證(三選一):**
+
+- **無痕視窗測試:** 用 `Ctrl+Shift+N` 開啟 Backstage URL — 擴充預設停用 — 訊息消失即可確認非 Backstage 問題
+- **任意網站對照:** 在同一 Chrome profile 開啟 `https://www.google.com`,F12 console 會看到同樣訊息
+- **暫停擴充:** `chrome://extensions/` 暫時關閉 AdBlock Plus / AdBlock,重新整理 Backstage,訊息消失即可確認
+
+**過濾掉這類雜訊:** F12 → Console → Filter 欄位輸入 `-listener`(前面加減號表示排除),即可隱藏所有包含 "listener" 的訊息,真正的錯誤仍會顯示。
+
+**真正的 Backstage / 平台錯誤長這樣(才需要處理):**
+
+- `Failed to fetch` 後接 `/api/catalog/...`、`/api/techdocs/...` 等 Backstage API 路徑
+- `404 Not Found` 出現在 Network 面板的紅色項目(非 console)
+- Stack trace 指向 `@backstage/...` 套件
+- Backstage 主畫面紅色橫幅錯誤(如先前的 TechDocs EROFS、YAML duplicate key 錯誤)
+
 ### Argo Rollouts dashboard 卡在 Loading…
 
 導覽至 `localhost:9080/rollouts`(無 namespace) 時,dashboard 預設嘗試載入 `argo-rollouts` namespace,該 namespace 內無 Rollout 資源因此卡住。請改用:

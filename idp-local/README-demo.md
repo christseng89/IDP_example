@@ -242,6 +242,33 @@ http://localhost:9080/rollouts/svc-beta
 
 `kubectl-argo-rollouts` 外掛未安裝,或不在 `PATH` 中。請參考執行前置作業 2 安裝。`demo.sh` 已將此外掛標記為選用 — 未安裝時 Steps 6/8/9/10 會改走 dashboard UI,流程仍可完整執行。
 
+### 「Backstage 點擊 Docs / Service 的 Docs 頁籤後顯示 404 + EROFS 錯誤」
+
+錯誤訊息類似:
+
+```
+Building a newer version of this documentation failed.
+Error: "Could not read MkDocs YAML config file mkdocs.yml...
+EROFS: read-only file system, open '/backstage/catalog/mkdocs.yml'"
+```
+
+**根本原因**(三層疊加):
+
+1. 每個 catalog entity 帶有 `backstage.io/techdocs-ref: dir:.` annotation,告訴 TechDocs「從這個 catalog YAML 同目錄找 `mkdocs.yml` + `docs/`」
+2. 該目錄(catalog ConfigMap mount)**只有 catalog YAML**,沒有任何 mkdocs 設定或 markdown 文件
+3. `techdocs.generator.runIn: local` 在缺檔時會嘗試**動態生成** `mkdocs.yml`,但該 mount 為 `readOnly: true` → `EROFS`
+
+**處理方式(已套用):** 從 `backstage/catalog/svc-alpha-catalog.yaml` 與 `svc-beta-catalog.yaml` 移除 `backstage.io/techdocs-ref` annotation。Docs 頁籤從此不再出現,Backstage 側邊欄的 Docs 連結會顯示「無文件」(不再 EROFS 崩潰)。
+
+**為何不直接補 docs 內容?** TechDocs 需要 per-service 的真實技術文件(`docs/index.md`、`mkdocs.yml`、可能還有圖片與多頁文件),這是 service team 自身的職責。IDP demo 重點在 platform-engineering 整合(Catalog 結構、K8s 即時狀態、Argo CD/Rollouts、Scaffolder golden path)而非教學如何寫文件。
+
+**若日後要啟用 TechDocs:**
+
+1. 在 service repo 加入 `mkdocs.yml` + `docs/index.md`(MkDocs 標準結構)
+2. 將 catalog entry 的 `techdocs-ref` 改為 `url:https://github.com/<org>/<svc>/tree/main`(或保持 `dir:.` 但確保 mount 內含 docs)
+3. 修改 `techdocs.generator.runIn: docker`(避免在 read-only ConfigMap 上動態產生)— 此選項需要 Backstage 容器內可呼叫 docker daemon,僅限非生產環境
+4. 或改用 `techdocs.publisher.type: googleGcs` / `awsS3` 等,讓 docs 預先 build 並上傳至 object storage(production 標準做法)
+
 ### 「Backstage 側邊選單的 Tech Radar 點擊後顯示 404 (Looks like someone dropped the mic!)」
 
 這是官方 `ghcr.io/backstage/backstage` 映像的**已知限制**,並非設定錯誤:
