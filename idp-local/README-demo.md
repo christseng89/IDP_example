@@ -242,6 +242,31 @@ http://localhost:9080/rollouts/svc-beta
 
 `kubectl-argo-rollouts` 外掛未安裝,或不在 `PATH` 中。請參考執行前置作業 2 安裝。`demo.sh` 已將此外掛標記為選用 — 未安裝時 Steps 6/8/9/10 會改走 dashboard UI,流程仍可完整執行。
 
+### 「Backstage 側邊選單的 Tech Radar 點擊後顯示 404 (Looks like someone dropped the mic!)」
+
+這是官方 `ghcr.io/backstage/backstage` 映像的**已知限制**,並非設定錯誤:
+
+- 映像是由 Backstage 上游 `packages/app`(default-app)建構,該 app 為展示用途,前端 sidebar 包含 Tech Radar 連結
+- 但 `TechRadarApi` 需要實際資料來源(`techRadar.url` 或自訂 API factory),官方映像未預設提供
+- 沒有資料時,前端 route 會 fallback 至 `NotFoundPage`(就是這個 "dropped the mic" 頁面)
+
+**為什麼 Helm chart 無法修正?** Backstage 的前端外掛是在**建構時 (compile time)** 編譯進 JavaScript bundle,Helm chart 只能注入 runtime config (`app-config.yaml`)、Service、Ingress、RBAC 等基礎設施,無法修改前端 bundle 內容。這不是 chart 設定錯誤,是 Backstage 框架本身的限制。
+
+**三個處理方式:**
+
+1. **設定資料來源(可能可行)** — 在 `backstage/app-config.yaml` 加入:
+   ```yaml
+   techRadar:
+     url: https://demo.backstage.io/tech-radar/sample.json
+   ```
+   要求企業網路可達 `demo.backstage.io`(常見被封鎖)。可改為自架的 ConfigMap-mounted JSON。
+
+2. **視為展示無關功能(建議)** — Tech Radar 是 Backstage 提供給組織自行curation 內容的工具,並非 IDP 平台核心能力。Demo 重點聚焦於運作的功能:Catalog、APIs、Docs、Create scaffolder、Kubernetes 即時狀態整合。
+
+3. **建構自訂映像(不推薦)** — 加入 `@backstage/plugin-tech-radar` 與自訂 `techRadarApiRef` 實作,並重新打 Docker image。這會回到先前已棄用的自建映像維護負擔。
+
+> 同類「點擊後 404」連結還可能出現在 Settings、Catalog Import 等位置,原因與處理方式相同。
+
 ### 「步驟 6 的 git commit 失敗」
 
 `scripts/install.sh` 的 Step 4b 會在 `idp-local/` 中初始化獨立的 git repo(供 ArgoCD `file:///idp-local` 使用)。若該步驟未成功,Step 6 的 `git add && git commit` 會失敗。手動修復:
