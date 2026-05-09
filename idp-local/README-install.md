@@ -284,6 +284,161 @@ http://localhost:9080/rollouts/svc-beta
 
 進入後可由右上 namespace 下拉切換。
 
+## 🔐 選用:啟用 SSO 登入(GitHub + Google)
+
+預設安裝採用 Backstage 的 **Guest 登入**(無 IdP、無密碼),適合本機 demo。
+若要為**多人共享環境**或**正式 demo 場景**啟用 SSO,可額外掛載 GitHub OAuth 與
+Google OAuth 兩個 Sign-in provider — 兩者皆已內建於官方映像 `ghcr.io/backstage/backstage:1.27.0`,
+無須建構自訂映像。
+
+### 步驟 1 — 註冊 OAuth 應用程式(per-attendee 或 per-environment)
+
+**GitHub OAuth App** (建議使用個人帳號或專屬 demo organization):
+
+1. 開啟 https://github.com/settings/developers → **New OAuth App**
+2. 填寫:
+   - Application name: `Backstage IDP Demo`
+   - Homepage URL: `http://backstage.localhost:9080`
+   - Authorization callback URL: `http://backstage.localhost:9080/api/auth/github/handler/frame`
+3. Register → 記下 **Client ID** → **Generate a new client secret** → 記下 **Client Secret**
+
+**Google Cloud OAuth Client** (需有 Google Cloud Project):
+
+1. 開啟 https://console.cloud.google.com/apis/credentials
+2. 上方選單建立新 Project(或選現有的)
+3. **+ CREATE CREDENTIALS** → **OAuth client ID**
+4. Application type: **Web application**
+5. Authorized redirect URIs: `http://backstage.localhost:9080/api/auth/google/handler/frame`
+6. CREATE → 記下 **Client ID** 與 **Client Secret**
+
+> ⚠️ **Callback / redirect URI 必須完全一致**(scheme + host + port + path),否則 OAuth provider 會回傳 `redirect_uri_mismatch` 錯誤。若你使用非 9080 的 `HTTP_PORT`,請相應調整。
+
+### 步驟 2 — 將 4 組 secrets 寫入 Kubernetes(不可進入 git)
+
+```bash
+kubectl create secret generic backstage-sso   -n backstage   --from-literal=AUTH_GITHUB_CLIENT_ID='Iv1.xxxxxxxx'   --from-literal=AUTH_GITHUB_CLIENT_SECRET='ghp_xxxxxxxxxxxx'   --from-literal=AUTH_GOOGLE_CLIENT_ID='nnn-yyy.apps.googleusercontent.com'   --from-literal=AUTH_GOOGLE_CLIENT_SECRET='GOCSPX-zzzzzzz'
+```
+
+> 此 Secret 與 backstage 的 ConfigMap / Deployment 同 namespace,Backstage pod 才能透過 `valueFrom.secretKeyRef` 讀取。
+
+### 步驟 3 — 複製範本檔案並啟用
+
+```bash
+cd backstage/
+cp app-config-sso.yaml.example app-config-sso.yaml
+# 此檔已加入 backstage/.gitignore,無需編輯內容
+```
+
+`app-config-sso.yaml` 本身**不含**任何 client secret — 它只引用 `${AUTH_GITHUB_CLIENT_ID}` 等環境變數,實際值由步驟 2 的 k8s Secret 注入。
+
+### 步驟 4 — 修改 Terraform 模組以掛載額外設定
+
+編輯 `terraform/modules/backstage/main.tf`,在 `helm_release.backstage` 的 values 區塊內:
+
+**4a. 為 `extraEnvVars` 新增四個變數:**
+
+```yaml
+extraEnvVars:
+  - name: ARGOCD_ADMIN_PASSWORD
+    valueFrom: { secretKeyRef: { name: backstage-argocd, key: ARGOCD_ADMIN_PASSWORD } }
+  - name: POSTGRES_PASSWORD
+    valueFrom: { secretKeyRef: { name: backstage-postgres, key: POSTGRES_PASSWORD } }
+  # ↓ 新增 4 行
+  - name: AUTH_GITHUB_CLIENT_ID
+    valueFrom: { secretKeyRef: { name: backstage-sso, key: AUTH_GITHUB_CLIENT_ID } }
+  - name: AUTH_GITHUB_CLIENT_SECRET
+    valueFrom: { secretKeyRef: { name: backstage-sso, key: AUTH_GITHUB_CLIENT_SECRET } }
+  - name: AUTH_GOOGLE_CLIENT_ID
+    valueFrom: { secretKeyRef: { name: backstage-sso, key: AUTH_GOOGLE_CLIENT_ID } }
+  - name: AUTH_GOOGLE_CLIENT_SECRET
+    valueFrom: { secretKeyRef: { name: backstage-sso, key: AUTH_GOOGLE_CLIENT_SECRET } }
+```
+
+**4b. 為 `extraAppConfig` 新增第二個 ConfigMap 引用(主設定檔之後):**
+
+```yaml
+extraAppConfig:
+  - filename: app-config.yaml
+    configMapRef: backstage-app-config
+  # ↓ 新增 — 將 SSO 設定層疊在主設定上
+  - filename: app-config-sso.yaml
+    configMapRef: backstage-app-config-sso
+```
+
+**4c. 在模組中新增第二個 ConfigMap 資源(與 `kubernetes_config_map.backstage_app_config` 並列):**
+
+```hcl
+resource "kubernetes_config_map" "backstage_app_config_sso" {
+  metadata {
+    name      = "backstage-app-config-sso"
+    namespace = kubernetes_namespace.backstage.metadata[0].name
+  }
+  data = {
+    "app-config-sso.yaml" = file("${var.project_root}/backstage/app-config-sso.yaml")
+  }
+}
+```
+
+**4d. 將該 ConfigMap 加入 `helm_release.backstage` 的 `depends_on`:**
+
+```hcl
+depends_on = [
+  kubernetes_config_map.backstage_app_config,
+  kubernetes_config_map.backstage_app_config_sso,   # 新增
+  kubernetes_config_map.backstage_catalog,
+  ...
+]
+```
+
+### 步驟 5 — 套用變更
+
+```bash
+cd terraform
+terraform apply   -replace='module.backstage.kubernetes_config_map.backstage_app_config_sso'   -replace='module.backstage.helm_release.backstage'   -var="project_root=$(cd .. && pwd)"   -var="http_port=${HTTP_PORT:-9080}"   -var="https_port=${HTTPS_PORT:-9443}"   -auto-approve
+cd ..
+
+kubectl rollout restart deployment -n backstage backstage
+kubectl rollout status  deployment -n backstage backstage --timeout=120s
+```
+
+### 步驟 6 — 驗證
+
+打開 `http://backstage.localhost:9080`,登入頁面應該出現**三張卡片**:
+
+- **Sign in as Guest** — 原本的 fallback,可保留供 demo 用
+- **Sign in using GitHub** — 點擊跳轉 GitHub OAuth → Authorize → 自動返回並登入
+- **Sign in using Google** — 同上,使用 Google 帳號
+
+若 OAuth callback 失敗,常見原因:
+
+| 症狀 | 原因 | 解決 |
+|---|---|---|
+| `redirect_uri_mismatch` | OAuth App 註冊的 callback URL 與實際不符 | 確認 Authorization callback URL 完全等於 `http://backstage.localhost:9080/api/auth/<provider>/handler/frame` |
+| 點擊登入後白屏,console 顯示 401 | k8s Secret 未建立或 key 名稱拼錯 | `kubectl get secret backstage-sso -n backstage -o yaml` 檢查所有 4 個 key 是否存在 |
+| `User not found` 錯誤 | catalog 無對應 User entity | 步驟 3 的範本檔案已包含 `emailMatchingUserEntityProfileEmail` fallback,允許未在 catalog 註冊的使用者登入 |
+| Pod CrashLoopBackOff | `app-config-sso.yaml` 不存在但 ConfigMap 已被 Terraform 建立(空檔案) | 確認步驟 3 的 `cp` 已執行,且檔案有實質內容 |
+
+### 移除 SSO(回到單純 Guest)
+
+```bash
+# 1. 從 main.tf 移除步驟 4 的所有變更(extraEnvVars 4 行、extraAppConfig 1 區塊、ConfigMap resource、depends_on 1 行)
+# 2. 套用
+cd terraform && terraform apply -replace='module.backstage.helm_release.backstage'   -var="project_root=$(cd .. && pwd)" -var="http_port=${HTTP_PORT:-9080}"   -var="https_port=${HTTPS_PORT:-9443}" -auto-approve
+# 3. 刪除 secret 與 SSO config 檔案
+kubectl delete secret backstage-sso -n backstage --ignore-not-found
+rm backstage/app-config-sso.yaml
+```
+
+### 與 Production 的差距
+
+此設定足夠 demo / staging,但要上 production 還缺:
+
+- **session 持久化:** 設定 `auth.session.secret`(從另一個 Secret 注入 `BACKEND_SECRET`),否則 pod 重啟後所有 session 失效
+- **catalog 中的 User / Group 實體:** 透過 `@backstage/plugin-catalog-backend-module-github-org` 或 `-msgraph` 自動同步(這兩個 plugin **不在** `default-app` 映像,需自訂映像)
+- **HTTPS:** OAuth provider 對非 localhost 的 production URL 通常要求 HTTPS;在 nginx-ingress 加 TLS termination 並更新 callback URL
+- **權限框架:** Backstage 1.13+ Permission API 可定義「只有 owner 能編輯該 entity」等規則,預設「所有登入者皆可」
+- **移除 guest fallback:** 從 `auth.providers` 中移除 `guest` 區塊,以及 `app-config-sso.yaml` 中 GitHub 設定的 `emailMatchingUserEntityProfileEmail` resolver
+
 ## 排查與拆除
 
 ```bash

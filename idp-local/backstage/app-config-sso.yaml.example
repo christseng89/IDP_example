@@ -1,0 +1,67 @@
+# backstage/app-config-sso.yaml.example
+#
+# Copy this file to backstage/app-config-sso.yaml (gitignored), fill in the
+# values, and follow README-install.md "🔐 選用:啟用 SSO 登入" to wire it
+# into the running Backstage instance.
+#
+# This file LAYERS ON TOP of the base backstage/app-config.yaml — Backstage
+# merges multiple --config inputs deep-key by deep-key, so anything here
+# overrides or adds to the base. The base keeps guest auth working as a
+# fallback; this file adds GitHub + Google OAuth alongside it.
+#
+# Two prerequisites BEFORE this file is read at runtime:
+#
+#   1. Register an OAuth App at each provider (per-environment / per-attendee):
+#
+#      GitHub:  https://github.com/settings/developers → New OAuth App
+#               Authorization callback URL:
+#                 http://backstage.localhost:9080/api/auth/github/handler/frame
+#               Note Client ID + generate a Client Secret.
+#
+#      Google:  https://console.cloud.google.com/apis/credentials → Create
+#               OAuth client ID → Web application
+#               Authorized redirect URI:
+#                 http://backstage.localhost:9080/api/auth/google/handler/frame
+#               Note Client ID + Client Secret.
+#
+#   2. Store the four secrets in a Kubernetes Secret in the backstage
+#      namespace (NOT in this file — keep credentials out of git):
+#
+#      kubectl create secret generic backstage-sso \
+#        -n backstage \
+#        --from-literal=AUTH_GITHUB_CLIENT_ID='Iv1.xxxxxxxx' \
+#        --from-literal=AUTH_GITHUB_CLIENT_SECRET='ghp_xxxxxxxxxxxx' \
+#        --from-literal=AUTH_GOOGLE_CLIENT_ID='nnn-yyy.apps.googleusercontent.com' \
+#        --from-literal=AUTH_GOOGLE_CLIENT_SECRET='GOCSPX-zzzzzzz'
+
+auth:
+  # 'development' relaxes some production safeguards. For real prod, use
+  # 'production' and provide a permanent backstage.io session secret via
+  # auth.session.secret (set BACKEND_SECRET env var alongside the OAuth ones).
+  environment: development
+
+  providers:
+    github:
+      development:
+        clientId: ${AUTH_GITHUB_CLIENT_ID}
+        clientSecret: ${AUTH_GITHUB_CLIENT_SECRET}
+        signIn:
+          resolvers:
+            # Match GitHub username to a Backstage User entity. For the
+            # demo there are no User entities yet, so add the second
+            # resolver as a permissive fallback.
+            - resolver: usernameMatchingUserEntityName
+            # DEMO-only: accept any GitHub user without requiring a
+            # matching catalog User entity. REMOVE this for production
+            # so unknown sign-ins are rejected instead of treated as
+            # anonymous-but-authenticated.
+            - resolver: emailMatchingUserEntityProfileEmail
+
+    google:
+      development:
+        clientId: ${AUTH_GOOGLE_CLIENT_ID}
+        clientSecret: ${AUTH_GOOGLE_CLIENT_SECRET}
+        signIn:
+          resolvers:
+            - resolver: emailMatchingUserEntityProfileEmail
+            - resolver: emailLocalPartMatchingUserEntityName

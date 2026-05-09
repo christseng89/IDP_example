@@ -3,7 +3,11 @@
     "allow": [
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\samfi\\\\Downloads\\\\IDP_example\\\\idp-local\" -Force)",
       "Bash(Select-Object Name, PSIsContainer)",
-      "Bash(Format-Table -AutoSize)"
+      "Bash(Format-Table -AutoSize)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git tag *)"
     ]
   }
 }
