@@ -4,14 +4,22 @@ metadata:
   name: new-idp-service
   title: New IDP Service
   description: >
-    Creates a new Node.js (Express) service following the IDP golden path:
-    v1/v2 API versioning, Prometheus metrics, Argo Rollouts canary strategy,
-    Backstage catalog entry, OpenAPI spec, and TechDocs.
+    [DEMO] Captures the parameters that a real golden-path scaffolder would
+    use to bootstrap a Node.js (Express) service: v1/v2 API versioning,
+    Prometheus metrics, Argo Rollouts canary strategy, catalog entry,
+    OpenAPI spec, and TechDocs.
+
+    This local-demo variant uses debug:log actions only — no Git push,
+    no real file generation — because the official Backstage image's
+    pod has no Git credentials and no persistent volume. The form flow
+    and success page are the same as a production scaffolder; only the
+    backing actions differ.
   tags:
     - nodejs
     - rest-api
     - canary
     - golden-path
+    - demo
 spec:
   owner: platform-team
   type: service
@@ -52,34 +60,67 @@ spec:
           default: "64Mi"
 
   steps:
-    - id: fetch-template
-      name: Fetch base template
-      action: fetch:template
+    - id: capture
+      name: Capture service parameters
+      action: debug:log
       input:
-        url: ./skeleton
-        values:
-          serviceName: ${{ parameters.serviceName }}
-          owner: ${{ parameters.owner }}
-          description: ${{ parameters.description }}
-          replicaCount: ${{ parameters.replicaCount }}
-          cpuRequest: ${{ parameters.cpuRequest }}
-          memoryRequest: ${{ parameters.memoryRequest }}
+        message: |
+          [DEMO] New IDP Service request received:
+            Service Name : ${{ parameters.serviceName }}
+            Owner Team   : ${{ parameters.owner }}
+            Description  : ${{ parameters.description }}
+            Replicas     : ${{ parameters.replicaCount }}
+            CPU request  : ${{ parameters.cpuRequest }}
+            Memory       : ${{ parameters.memoryRequest }}
 
-    - id: publish
-      name: Publish to local filesystem
-      action: publish:file
+    - id: would-create-repo
+      name: (would) Create Git repo from skeleton
+      action: debug:log
       input:
-        path: ./services/${{ parameters.serviceName }}
+        message: |
+          In production this step would render the Node.js skeleton
+          (Express + Pino + Prometheus client) with the captured values,
+          then git init + add + commit + push to the configured Git host
+          (e.g. github:repoUrl=github.com?owner=...&repo=${{ parameters.serviceName }}).
 
-    - id: register
-      name: Register in Backstage catalog
-      action: catalog:register
+          Required Backstage config for production:
+            - integrations.github (or gitlab/bitbucket) with a token
+            - scaffolder.defaultAuthor + defaultCommitMessage in app-config
+
+    - id: would-bootstrap-cd
+      name: (would) Add Argo CD Application
+      action: debug:log
       input:
-        catalogInfoPath: ./catalog-info.yaml
+        message: |
+          In production this step would create an Argo CD Application
+          pointing at the newly-pushed repo's chart path, mirroring the
+          existing svc-alpha / svc-beta Application definitions.
+
+    - id: would-register
+      name: (would) Register in Backstage catalog
+      action: debug:log
+      input:
+        message: |
+          In production this step would register the new repo's
+          catalog-info.yaml so the service appears in the Catalog
+          alongside svc-alpha and svc-beta.
 
   output:
+    text:
+      - title: Demo summary
+        content: |
+          The form captured **${{ parameters.serviceName }}** ready for the
+          golden-path. In a production environment, the three "(would)"
+          steps above would be replaced with real `publish:github`,
+          `argocd:create-resources`, and `catalog:register` actions.
+
+          Existing in-cluster services demonstrating the full flow:
+          - **svc-alpha** — full canary rollout with AnalysisTemplate
+          - **svc-beta** — downstream dependency
     links:
-      - title: Service in Catalog
-        entityRef: component:default/${{ parameters.serviceName }}
-      - title: Argo CD Application
-        url: http://localhost/argocd/applications/${{ parameters.serviceName }}
+      - title: Argo CD (existing apps)
+        url: /argocd
+        icon: catalog
+      - title: Backstage Catalog
+        url: /catalog
+        icon: catalog
