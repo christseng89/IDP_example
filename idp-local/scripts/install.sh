@@ -170,6 +170,11 @@ HUB_IMAGES=(
   # ArgoCD — Redis subchart from Bitnami / docker.io
   "redis:7.2.4-alpine"
 
+  # Backstage Postgres backing store (modules/backstage/main.tf).
+  # Pre-pulling avoids a 1-2 minute first-install stall while kubelet
+  # downloads from docker.io directly on networks where it is throttled.
+  "postgres:16-alpine"
+
   # NOTE: bitnami/kubectl:1.28.5 (used by Kyverno cleanup CronJobs) left
   # Docker Hub in Oct 2023; registry.bitnami.com is often blocked on
   # mirrored networks.  The CronJobs are disabled in Terraform values
@@ -181,7 +186,10 @@ HUB_IMAGES=(
 GHCR_IMAGES=(
   # Kyverno cleanup-controller Deployment (chart 3.1.4 / app v1.11.4)
   "kyverno/cleanup-controller:v1.11.4"
-  # Backstage is built locally (idp-backstage:latest) — no pre-pull needed
+  # Backstage official image (chart 1.9.4 default appVersion). Pre-pulling
+  # via GHCR_MIRROR keeps the helm install from blocking on a slow ghcr.io
+  # download — same pattern as the quay.io / docker.io image pre-pulls.
+  "backstage/backstage:1.27.0"
 )
 
 # quay.io images — pulled via QUAY_MIRROR and retagged to quay.io. Tags below
@@ -269,26 +277,6 @@ done
 for img in "${QUAY_IMAGES[@]}"; do
   prepull_quay "$img"
 done
-
-# ────────────────────────────────────────────────────────────────────────────
-step "Step 3a — Build custom Backstage image (idp-backstage:latest)"
-# ────────────────────────────────────────────────────────────────────────────
-# The custom image bakes in the notifications plugin so the frontend DI
-# container has an implementation for notificationsApiRef at startup.
-# Docker Desktop shares the host daemon, so the image is available to
-# Kubernetes immediately without a registry push (pullPolicy: Never).
-
-if [[ "$SKIP_BUILD" == "true" ]]; then
-  warn "SKIP_BUILD=true — skipping Backstage image build"
-  if docker image inspect idp-backstage:latest >/dev/null 2>&1; then
-    ok "idp-backstage:latest already present"
-  else
-    fail "idp-backstage:latest missing — re-run without SKIP_BUILD."
-    exit 1
-  fi
-else
-  bash "$REPO_ROOT/scripts/build-backstage.sh"
-fi
 
 # ────────────────────────────────────────────────────────────────────────────
 step "Step 3b — Build service images (svc-alpha, svc-beta)"
@@ -720,7 +708,9 @@ K8S_TARGETS=(
   -target='module.backstage.kubernetes_config_map.backstage_catalog'
   -target='module.backstage.kubernetes_config_map.backstage_scaffolder'
   -target='module.backstage.kubernetes_secret.backstage_argocd'
-  -target='module.backstage.kubernetes_secret.backstage_k8s_token'
+  -target='module.backstage.kubernetes_secret.backstage_postgres'
+  -target='module.backstage.kubernetes_deployment.backstage_postgres'
+  -target='module.backstage.kubernetes_service.backstage_postgres'
 )
 
 # Reconcile orphan resources — when the provider plugin crashes mid-create,
@@ -749,7 +739,9 @@ K8S_IMPORTS=(
   "module.backstage.kubernetes_config_map.backstage_catalog|backstage/backstage-catalog"
   "module.backstage.kubernetes_config_map.backstage_scaffolder|backstage/backstage-scaffolder"
   "module.backstage.kubernetes_secret.backstage_argocd|backstage/backstage-argocd"
-  "module.backstage.kubernetes_secret.backstage_k8s_token|backstage/backstage-k8s-token"
+  "module.backstage.kubernetes_secret.backstage_postgres|backstage/backstage-postgres"
+  "module.backstage.kubernetes_deployment.backstage_postgres|backstage/backstage-postgres"
+  "module.backstage.kubernetes_service.backstage_postgres|backstage/backstage-postgres"
 )
 
 # evict_newer_provider_state — secondary safety net for the "Resource instance
@@ -824,9 +816,9 @@ reconcile_orphans() {
     case "$kind" in
       namespace)
         kubectl get ns "$cid" >/dev/null 2>&1 && exists=true ;;
-      service_account|config_map|secret)
+      service_account|config_map|secret|deployment|service)
         local ns="${cid%%/*}" name="${cid##*/}"
-        # config_map → configmap, service_account → serviceaccount
+        # config_map → configmap, service_account → serviceaccount, deployment → deployment, service → service
         local k="${kind//_/}"
         kubectl get "$k" "$name" -n "$ns" >/dev/null 2>&1 && exists=true ;;
       cluster_role)
@@ -898,7 +890,7 @@ apply_with_retry() {
   return 1
 }
 
-apply_with_retry "Phase 1/2: creating 17 kubernetes_* resources serially" \
+apply_with_retry "Phase 1/2: creating 19 kubernetes_* resources serially" \
   -parallelism=1 "${TF_VARS[@]}" "${K8S_TARGETS[@]}"
 ok "Kubernetes resources created"
 
@@ -957,7 +949,15 @@ fi
 
 echo ""
 echo -e "${BOLD}Platform endpoints${NC}"
-echo "  Backstage Portal    ${BASE_URL}/backstage"
+# Backstage runs on its own hostname (backstage.localhost). The host port
+# is the same as nginx-ingress (HTTP_PORT). RFC 6761 + modern browsers
+# resolve *.localhost → 127.0.0.1 automatically; no hosts file edit needed.
+if [[ "$HTTP_PORT" == "80" ]]; then
+  BACKSTAGE_URL="http://backstage.localhost"
+else
+  BACKSTAGE_URL="http://backstage.localhost:${HTTP_PORT}"
+fi
+echo "  Backstage Portal    ${BACKSTAGE_URL}"
 echo "  Argo CD             ${BASE_URL}/argocd            admin / $ARGOCD_PWD"
 echo "  Argo Rollouts UI    ${BASE_URL}/rollouts"
 echo "  Grafana             ${BASE_URL}/grafana           admin / idp-demo"
@@ -976,11 +976,3 @@ echo ""
 echo "Tear down everything:"
 echo "  cd $REPO_ROOT/terraform && terraform destroy \\"
 echo "    -var=\"project_root=$REPO_ROOT\" -auto-approve"
-echo "If a URL returns 404 or hangs:"
-echo "  kubectl get pods -A | grep -vE 'Running|Completed'"
-echo "  kubectl get ingress -A"
-echo ""
-echo "Tear down everything:"
-echo "  cd $REPO_ROOT/terraform && terraform destroy \\"
-echo "    -var=\"project_root=$REPO_ROOT\" -auto-approve"
-pprove"

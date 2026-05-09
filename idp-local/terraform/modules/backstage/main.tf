@@ -81,13 +81,22 @@ resource "kubernetes_config_map" "backstage_app_config" {
     "app-config.yaml" = templatefile(
       "${var.project_root}/backstage/app-config.yaml",
       {
-        base_url   = "http://localhost:${var.http_port}/backstage"
-        # CORS origin must be scheme://host:port WITHOUT path. Setting it to
-        # the full base_url (with /backstage suffix) silently breaks POSTs
-        # from the frontend to the backend, including the guest auth flow
-        # — Chrome rejects the response, frontend errors out, React Router
-        # falls through to NotFoundPage rendering "dropped the mic" 404.
-        cors_origin = "http://localhost:${var.http_port}"
+        # Backstage serves on its OWN hostname (backstage.localhost) instead
+        # of a sub-path. The official ghcr.io/backstage/backstage image is
+        # built with webpack publicPath='/' at compile time, so the SPA's
+        # HTML hardcodes absolute paths (/static/..., /manifest.json,
+        # /vendor.css). Mounting at /backstage and stripping the prefix
+        # in nginx breaks every one of those static assets — they 404
+        # because the browser fetches them from the root of localhost.
+        # Putting Backstage on its own host means the frontend can keep
+        # using absolute paths and they all resolve correctly.
+        #
+        # *.localhost resolves to 127.0.0.1 automatically per RFC 6761
+        # in Chrome/Firefox/Safari/modern Windows, so no hosts file edit
+        # is required. If your resolver disagrees, add this to hosts:
+        #   127.0.0.1 backstage.localhost
+        base_url    = "http://backstage.localhost:${var.http_port}"
+        cors_origin = "http://backstage.localhost:${var.http_port}"
       }
     )
   }
@@ -117,18 +126,6 @@ resource "kubernetes_config_map" "backstage_scaffolder" {
   }
 }
 
-# ServiceAccount token for the Kubernetes plugin — referenced in app-config.yaml
-resource "kubernetes_secret" "backstage_k8s_token" {
-  metadata {
-    name      = "backstage-k8s-token"
-    namespace = kubernetes_namespace.backstage.metadata[0].name
-    annotations = {
-      "kubernetes.io/service-account.name" = kubernetes_service_account.backstage.metadata[0].name
-    }
-  }
-  type = "kubernetes.io/service-account-token"
-}
-
 resource "kubernetes_secret" "backstage_argocd" {
   metadata {
     name      = "backstage-argocd"
@@ -140,6 +137,100 @@ resource "kubernetes_secret" "backstage_argocd" {
   }
 }
 
+
+# ── Postgres backing store for Backstage ─────────────────────────────────────
+# Replaces the previous in-memory SQLite (better-sqlite3 ":memory:") so
+# Backstage data — catalog entities, locations, scaffolder runs, auth tokens
+# — survives backend restarts. emptyDir storage is fine for the demo: the
+# catalog itself is reloaded from backstage-catalog ConfigMap on every start,
+# so losing pgdata only forces Backstage to re-process the catalog.
+
+resource "kubernetes_secret" "backstage_postgres" {
+  metadata {
+    name      = "backstage-postgres"
+    namespace = kubernetes_namespace.backstage.metadata[0].name
+  }
+  data = {
+    POSTGRES_USER     = "backstage"
+    POSTGRES_PASSWORD = "demo-password-rotate-for-prod"
+    POSTGRES_DB       = "backstage"
+  }
+}
+
+resource "kubernetes_deployment" "backstage_postgres" {
+  metadata {
+    name      = "backstage-postgres"
+    namespace = kubernetes_namespace.backstage.metadata[0].name
+    labels    = { app = "backstage-postgres" }
+  }
+
+  spec {
+    replicas = 1
+    strategy { type = "Recreate" }   # avoid two pods writing to the same emptyDir
+    selector { match_labels = { app = "backstage-postgres" } }
+
+    template {
+      metadata { labels = { app = "backstage-postgres" } }
+      spec {
+        container {
+          name  = "postgres"
+          image = "postgres:16-alpine"
+          image_pull_policy = "IfNotPresent"
+          port {
+            name           = "postgres"
+            container_port = 5432
+          }
+          env_from {
+            secret_ref { name = kubernetes_secret.backstage_postgres.metadata[0].name }
+          }
+          # subPath lets postgres own a sub-directory of the emptyDir mount —
+          # required because the postgres image's init scripts reject mounts
+          # that aren't empty (and emptyDir contains a "lost+found" entry on
+          # some kernels).
+          volume_mount {
+            name       = "data"
+            mount_path = "/var/lib/postgresql/data"
+            sub_path   = "pgdata"
+          }
+          resources {
+            requests = { cpu = "100m", memory = "128Mi" }
+            limits   = { cpu = "500m", memory = "512Mi" }
+          }
+          readiness_probe {
+            exec { command = ["pg_isready", "-U", "backstage", "-d", "backstage"] }
+            initial_delay_seconds = 5
+            period_seconds        = 10
+          }
+          liveness_probe {
+            exec { command = ["pg_isready", "-U", "backstage", "-d", "backstage"] }
+            initial_delay_seconds = 30
+            period_seconds        = 30
+          }
+        }
+        volume {
+          name = "data"
+          empty_dir {}
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service" "backstage_postgres" {
+  metadata {
+    name      = "backstage-postgres"
+    namespace = kubernetes_namespace.backstage.metadata[0].name
+  }
+  spec {
+    selector = { app = "backstage-postgres" }
+    port {
+      name        = "postgres"
+      port        = 5432
+      target_port = 5432
+    }
+  }
+}
+
 resource "helm_release" "backstage" {
   name       = "backstage"
   repository = "https://backstage.github.io/charts"
@@ -148,17 +239,24 @@ resource "helm_release" "backstage" {
   namespace  = kubernetes_namespace.backstage.metadata[0].name
 
   values = [<<-YAML
+    # Use the OFFICIAL Backstage image from the chart (ghcr.io/backstage/backstage,
+    # tag defaults to the chart's appVersion). This replaces the previous
+    # self-built idp-backstage:latest image, which kept hitting node module
+    # resolution / CMD-override issues that left the pod in CrashLoopBackOff.
+    #
+    # Chart 1.9.4 templates the image as:
+    #   {{ .Values.backstage.image.registry }}/{{ .Values.backstage.image.repository }}:{{ .Values.backstage.image.tag | default .Chart.AppVersion }}
+    # so registry MUST be a separate field — embedding "ghcr.io/" in repository
+    # produces "ghcr.io/ghcr.io/..." which 404s.
     backstage:
       image:
-        registry: ""
-        repository: idp-backstage
-        tag: latest
-        # Backstage chart 1.9.4's values.schema.json restricts pullPolicy to
-        # "Always" or "IfNotPresent" — "Never" is rejected with a schema
-        # error. IfNotPresent is functionally equivalent here: Docker Desktop
-        # shares its image daemon with Kubernetes, and scripts/build-backstage.sh
-        # always builds idp-backstage:latest before this Helm release runs, so
-        # the image is present and kubelet skips the pull.
+        registry: ghcr.io
+        repository: backstage/backstage
+        # Pin to the chart's released appVersion so a chart bump doesn't
+        # silently change the binary. install.sh pre-pulls this exact tag
+        # via GHCR_MIRROR (default ghcr.m.daocloud.io) and retags it to the
+        # canonical reference, so kubelet finds it locally.
+        tag: "1.27.0"
         pullPolicy: IfNotPresent
 
       resources:
@@ -167,19 +265,36 @@ resource "helm_release" "backstage" {
           memory: 256Mi
         limits:
           cpu: 500m
-          memory: 512Mi
+          memory: 1Gi
 
+      # Inject runtime secrets the official Backstage image needs at startup:
+      # - ARGOCD_ADMIN_PASSWORD: substituted into app-config.yaml's argocd
+      #   stanza (currently no-op because the official image lacks the argocd
+      #   plugin, but kept so the catalog config remains valid).
+      # - POSTGRES_PASSWORD: substituted into app-config.yaml's
+      #   backend.database.connection.password — the in-cluster Postgres
+      #   instance defined above is reached via the backstage-postgres
+      #   ClusterIP service.
       extraEnvVars:
         - name: ARGOCD_ADMIN_PASSWORD
           valueFrom:
             secretKeyRef:
               name: backstage-argocd
               key: ARGOCD_ADMIN_PASSWORD
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: backstage-postgres
+              key: POSTGRES_PASSWORD
+
+      # Mount our IDP app-config + catalog + scaffolder template into the
+      # official image. The image bundles a default app-config.yaml; we
+      # override it via --config (chart-default args) pointing at our mount.
+      extraAppConfig:
+        - filename: app-config.yaml
+          configMapRef: backstage-app-config
 
       extraVolumes:
-        - name: app-config
-          configMap:
-            name: backstage-app-config
         - name: catalog
           configMap:
             name: backstage-catalog
@@ -188,10 +303,6 @@ resource "helm_release" "backstage" {
             name: backstage-scaffolder
 
       extraVolumeMounts:
-        - name: app-config
-          mountPath: /app/app-config.yaml
-          subPath: app-config.yaml
-          readOnly: true
         - name: catalog
           mountPath: /backstage/catalog
           readOnly: true
@@ -200,31 +311,19 @@ resource "helm_release" "backstage" {
           subPath: template.yaml
           readOnly: true
 
-      # The Backstage chart 1.9.4 deployment template hardcodes
-      #   command: ["node", "packages/backend"]
-      # which OVERRIDES whatever CMD is set in the Docker image. With modern
-      # @backstage/cli, packages/backend has no index.js and its package.json
-      # has no "main" field — Node fails with:
-      #   Error: Cannot find module '/app/packages/backend'
-      # Override command here to point at the compiled entry directly. Patching
-      # the Dockerfile alone is not sufficient: Kubernetes uses the chart's
-      # command, not the image's CMD.
-      command:
-        - "node"
-        - "packages/backend/dist/index.cjs.js"
-
-      args:
-        - "--config"
-        - "/app/app-config.yaml"
+      # NOTE: deliberately NO `command:` / `args:` overrides. The official
+      # image has the correct entrypoint baked in (node packages/backend ...);
+      # overriding them is what broke the previous self-built image.
 
     # Chart's built-in ingress only supports root path "/" — we create our own
-    # below so that NGINX can rewrite /backstage/* to / for the Backstage app.
+    # below so NGINX can rewrite /backstage/* to / for the Backstage SPA.
     ingress:
       enabled: false
 
     serviceAccount:
       name: backstage
       create: false
+
   YAML
   ]
 
@@ -236,8 +335,10 @@ resource "helm_release" "backstage" {
     kubernetes_config_map.backstage_catalog,
     kubernetes_config_map.backstage_scaffolder,
     kubernetes_secret.backstage_argocd,
-    kubernetes_secret.backstage_k8s_token,
     kubernetes_cluster_role_binding.backstage_reader,
+    kubernetes_secret.backstage_postgres,
+    kubernetes_deployment.backstage_postgres,
+    kubernetes_service.backstage_postgres,
   ]
 }
 
@@ -251,21 +352,21 @@ resource "kubectl_manifest" "backstage_ingress" {
     metadata:
       name: backstage
       namespace: backstage
-      annotations:
-        nginx.ingress.kubernetes.io/use-regex: "true"
-        nginx.ingress.kubernetes.io/rewrite-target: /$2
-        # Redirect /backstage (no trailing slash) to /backstage/ so the SPA
-        # asset paths (/backstage/static/...) resolve correctly.
-        nginx.ingress.kubernetes.io/configuration-snippet: |
-          rewrite ^/backstage$ /backstage/ permanent;
     spec:
       ingressClassName: nginx
       rules:
-        - host: localhost
+        # backstage.localhost — RFC 6761 reserves *.localhost for loopback,
+        # so modern OSes resolve it to 127.0.0.1 without a hosts entry.
+        # If your resolver disagrees, add: 127.0.0.1 backstage.localhost
+        # to %WINDIR%\System32\drivers\etc\hosts (admin required).
+        # No rewrite-target / no regex / no configuration-snippet — the
+        # SPA's hardcoded absolute paths (/static/*, /manifest.json) resolve
+        # cleanly when Backstage owns the entire host.
+        - host: backstage.localhost
           http:
             paths:
-              - path: /backstage(/|$)(.*)
-                pathType: ImplementationSpecific
+              - path: /
+                pathType: Prefix
                 backend:
                   service:
                     name: backstage

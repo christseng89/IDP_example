@@ -10,8 +10,19 @@ backend:
   listen:
     port: 7007
   database:
-    client: better-sqlite3
-    connection: ':memory:'
+    # Postgres backing store, deployed in-cluster as backstage-postgres
+    # (see modules/backstage/main.tf). The $${POSTGRES_PASSWORD} below is
+    # templatefile() escape syntax — it renders to a literal env-var ref,
+    # which Backstage's config-loader then resolves at runtime from the
+    # env var injected via extraEnvVars (sourced from the
+    # backstage-postgres k8s Secret).
+    client: pg
+    connection:
+      host: backstage-postgres
+      port: 5432
+      user: backstage
+      password: $${POSTGRES_PASSWORD}
+      database: backstage
   cors:
     # CORS origin must NOT include a path — only scheme://host:port.
     origin: ${cors_origin}
@@ -28,16 +39,11 @@ techdocs:
 
 auth:
   providers:
-    # Guest auth is the simplest provider — no IdP, no secrets. Backstage's
-    # auth-backend plugin only registers the /api/auth/guest/refresh route
-    # if this block exists; an empty providers map means the frontend's
-    # Guest sign-in card calls a 404 endpoint and rendering falls through
-    # to NotFoundPage ("Looks like someone dropped the mic!").
-    #
-    # The Dockerfile sets NODE_ENV=production, and guest auth is disabled
-    # outside development by default (Backstage assumes you'd use a real
-    # IdP in prod). Override that with dangerouslyAllowOutsideDevelopment
-    # for this local demo deployment.
+    # Guest auth — no IdP, no secrets. Backstage's auth-backend plugin only
+    # registers the /api/auth/guest/refresh route if this block exists.
+    # The official Backstage image has NODE_ENV=production set, and guest
+    # auth is disabled outside development by default; override that with
+    # dangerouslyAllowOutsideDevelopment for this local demo.
     guest:
       dangerouslyAllowOutsideDevelopment: true
 
@@ -53,6 +59,10 @@ catalog:
       rules:
         - allow: [System, Group, Location]
 
+# ArgoCD plugin config. The official ghcr.io/backstage/backstage image does
+# NOT include @roadiehq/backstage-plugin-argo-cd-backend, so this section is
+# silently ignored by the running app. It's left here for documentation and
+# for future use if you swap to a custom image that bundles the plugin.
 argocd:
   username: admin
   password: $${ARGOCD_ADMIN_PASSWORD}
@@ -63,6 +73,15 @@ argocd:
         - name: local
           url: http://argocd-server.argocd.svc.cluster.local
 
+# Kubernetes plugin: use IN-CLUSTER auth via the pod's mounted ServiceAccount
+# token (at /var/run/secrets/kubernetes.io/serviceaccount/token). No
+# explicit serviceAccountToken needed — the kubernetes-backend plugin in
+# the official image picks it up automatically when authProvider is
+# 'serviceAccount' and no token is given.
+#
+# The Backstage SA must have RBAC to list pods/deployments/etc — that's
+# provided by the kubernetes_cluster_role_binding.backstage_reader resource
+# in modules/backstage/main.tf.
 kubernetes:
   serviceLocatorMethod:
     type: multiTenant
@@ -73,7 +92,3 @@ kubernetes:
           url: https://kubernetes.default.svc
           authProvider: serviceAccount
           skipTLSVerify: true # demo-only: Docker Desktop uses a self-signed cert
-          serviceAccountToken:
-            $secret:
-              name: backstage-k8s-token
-              key: token
